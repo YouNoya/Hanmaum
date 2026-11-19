@@ -1,0 +1,92 @@
+@layer components {
+  .hm-modal {
+    border: 0;
+    padding: 0;
+    color: var(--hm-color-text-primary);
+    background: transparent;
+    max-height: calc(100dvh - 40px);
+    overflow: auto;
+    overscroll-behavior: contain;
+  }
+  .hm-modal::backdrop {
+    background: color-mix(
+      in srgb,
+      var(--hm-color-text-primary) 40%,
+      transparent
+    );
+  }
+  .hm-modal[data-variant="dialog"] {
+    margin: auto;
+    width: calc(100% - 40px);
+    max-width: 350px;
+    border-radius: var(--hm-radius-20);
+  }
+  .hm-modal[data-variant="sheet"] {
+    position: fixed;
+    inset: auto 0 0;
+    margin: 0 auto;
+    width: 100%;
+    max-width: 512px;
+    max-height: calc(100dvh - 20px);
+    border-radius: var(--hm-radius-24) var(--hm-radius-24) 0 0;
+  }
+
+  /* 닫힐 때도 브라우저가 top layer를 유지한다. 미지원 브라우저는 즉시 닫힌다. */
+  @supports (transition-behavior: allow-discrete) {
+    .hm-modal {
+      opacity: 0;
+      transform: translateY(8px) scale(0.98);
+      transition:
+        opacity 180ms ease-out,
+        transform 300ms ease-out,
+        overlay 220ms allow-discrete,
+        display 220ms allow-discrete;
+    }
+    .hm-modal[data-variant="sheet"] {
+      transform: translateY(100%);
+    }
+    .hm-modal[open] {
+      opacity: 1;
+      transform: none;
+    }
+    .hm-modal::backdrop {
+      background-color: transparent;
+      transition:
+        background-color 180ms ease-out,
+        overlay 220ms allow-discrete,
+        display 220ms allow-discrete;
+    }
+    .hm-modal[open]::backdrop {
+      background-color: color-mix(
+        in srgb,
+        var(--hm-color-text-primary) 40%,
+        transparent
+      );
+    }
+    @starting-style {
+      .hm-modal[open] {
+        opacity: 0;
+        transform: translateY(8px) scale(0.98);
+      }
+      .hm-modal[data-variant="sheet"][open] {
+        transform: translateY(100%);
+      }
+      .hm-modal[open]::backdrop {
+        background-color: transparent;
+      }
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .hm-modal,
+    .hm-modal::backdrop {
+      transition: none;
+    }
+    @starting-style {
+      .hm-modal[open],
+      .hm-modal[data-variant="sheet"][open] {
+        opacity: 1;
+        transform: none;
+      }
+    }
+  }
+}

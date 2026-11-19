@@ -1,0 +1,21 @@
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 2
+
+app:
+  invitations:
+    encryption-key: dGVzdC1vbmx5LWludml0YXRpb24ta2V5LTMyYnl0ZXM=
+    url-prefix: http://localhost:5173/invitations/
+  commands:
+    digest-key: test-only-command-digest-key-not-for-production
+  security:
+    public-docs: true
+    allowed-origins:
+      - http://localhost:5173
+
+springdoc:
+  api-docs:
+    enabled: true
+  swagger-ui:
+    enabled: true

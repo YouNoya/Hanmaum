@@ -1,0 +1,16 @@
+# Build artifacts
+dist
+dist-ssr
+build
+coverage
+.certs
+
+
+# Package Manager files
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
+
+# Editor config
+.vscode
+.idea

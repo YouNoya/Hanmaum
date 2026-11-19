@@ -1,3 +1,18 @@
-# Local export instructions and the old empty-directory placeholder.
-EXPORT-GUIDE.md
-assets/.gitkeep
+# Local credentials and environment files
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Local dependencies, build output and caches
+node_modules/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.gradle/
+build/
+dist/
+*.log
+.DS_Store
+Thumbs.db

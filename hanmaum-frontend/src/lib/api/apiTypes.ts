@@ -1,0 +1,68 @@
+export interface ApiFieldError {
+  field: string;
+  reason: string;
+}
+
+interface ApiResponseBase {
+  code: string;
+  message: string;
+  errors: ApiFieldError[];
+  timestamp: string;
+}
+
+export interface ApiSuccess<T> extends ApiResponseBase {
+  success: true;
+  data: T;
+}
+
+export interface ApiFailure extends ApiResponseBase {
+  success: false;
+  data: null;
+}
+
+export type ApiResponse<T> = ApiSuccess<T> | ApiFailure;
+
+// Keep HTTP status and response metadata: 202 ACCEPTED is not task completion.
+export interface ApiResult<T> {
+  status: number;
+  body: ApiSuccess<T>;
+}
+
+export type ApiPath = `/api/${string}`;
+export type ApiMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+type QueryValue = string | number | boolean | null | undefined;
+
+export interface ApiRequestOptions {
+  /** Contract success status. Defaults to 200; mutations declare 201/202 when needed. */
+  expectedStatus?: number | readonly number[];
+  /** Only identity probes, logout and explicitly public endpoints bypass the session gate. */
+  session?: "independent";
+  method?: ApiMethod;
+  params?: Record<string, QueryValue | QueryValue[]>;
+  body?: unknown;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+export interface CsrfToken {
+  headerName: string;
+  token: string;
+}
+
+export type ApiErrorKind =
+  | "http"
+  | "network"
+  | "timeout"
+  | "cancelled"
+  | "invalid-response"
+  | "configuration"
+  | "unknown";
+
+export interface ApiErrorOptions {
+  kind: ApiErrorKind;
+  message: string;
+  status?: number;
+  code?: string;
+  errors?: ApiFieldError[];
+  timestamp?: string;
+}

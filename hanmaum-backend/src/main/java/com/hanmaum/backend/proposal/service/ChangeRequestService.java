@@ -1,0 +1,584 @@
+package com.hanmaum.backend.proposal.service;
+
+import com.hanmaum.backend.careitem.dto.CareItemAnswerSubmission;
+import com.hanmaum.backend.careitem.service.*;
+import com.hanmaum.backend.careitem.service.CareItemApplicationService.LockedItem;
+import com.hanmaum.backend.carespace.dto.*;
+import com.hanmaum.backend.carespace.service.CareSpaceAccessService;
+import com.hanmaum.backend.carespace.service.CareSpaceInformationApplicationService;
+import com.hanmaum.backend.global.code.CommonErrorCode;
+import com.hanmaum.backend.global.command.*;
+import com.hanmaum.backend.global.exception.ApiException;
+import com.hanmaum.backend.proposal.code.ProposalErrorCode;
+import com.hanmaum.backend.proposal.dto.*;
+import com.hanmaum.backend.proposal.repository.*;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.*;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
+
+/** Member requests preserve intent; only an owner decision mutates actual care items. */
+@Service
+@Transactional
+public class ChangeRequestService {
+  private final CareSpaceAccessService access;
+  private final ChangeRequestRepository requests;
+  private final ProposalDecisionRepository proposals;
+  private final CareItemApplicationService applications;
+  private final ProposalApplicationValidator validator;
+  private final EditLockService leases;
+  private final ChangeRequestReviewToken reviews;
+  private final CommandReceiptRepository receipts;
+  private final CommandDigest digests;
+  private final ObjectMapper mapper;
+  private final Clock clock;
+  private final CareSpaceInformationApplicationService spaceInformation;
+
+  public ChangeRequestService(
+      CareSpaceAccessService access,
+      ChangeRequestRepository requests,
+      ProposalDecisionRepository proposals,
+      CareItemApplicationService applications,
+      ProposalApplicationValidator validator,
+      EditLockService leases,
+      ChangeRequestReviewToken reviews,
+      CommandReceiptRepository receipts,
+      CommandDigest digests,
+      ObjectMapper mapper,
+      Clock clock,
+      CareSpaceInformationApplicationService spaceInformation) {
+    this.access = access;
+    this.requests = requests;
+    this.proposals = proposals;
+    this.applications = applications;
+    this.validator = validator;
+    this.leases = leases;
+    this.reviews = reviews;
+    this.receipts = receipts;
+    this.digests = digests;
+    this.mapper = mapper;
+    this.clock = clock;
+    this.spaceInformation = spaceInformation;
+  }
+
+  public JsonNode submit(UUID actor, UUID space, JsonNode input) {
+    validateSize(input);
+    var request = ProposalDecisionRequest.submission(input);
+    var logical = mapper.createArrayNode();
+    for (var e : request.entries()) {
+      var l =
+          logical
+              .addObject()
+              .put("proposalId", text(e.proposalId()))
+              .put("action", e.action().name());
+      l.put("targetItemId", text(e.targetItemId()));
+      l.put("expectedItemVersion", e.expectedItemVersion());
+      if (e.expectedSpaceVersion() != null) l.put("expectedSpaceVersion", e.expectedSpaceVersion());
+      l.set("values", e.values() == null ? mapper.nullNode() : e.values());
+    }
+    var command =
+        begin(actor, space, request.clientRequestId(), "SUBMIT_CHANGE_REQUEST", null, logical);
+    var current = access.requireActiveMember(actor, space);
+    if (current.role() != CareSpaceRole.MEMBER) throw forbidden();
+    if (command.previous() != null)
+      return requests.submissionResult(space, replay(command, current.membershipId()));
+    if (request.entries().stream().filter(e -> e.action() == ProposalAction.UPDATE_SPACE).count()
+        > 1) throw batchConflict();
+    var loaded =
+        loadProposals(
+            space,
+            request.entries().stream()
+                .map(ProposalDecisionRequest.Entry::proposalId)
+                .filter(Objects::nonNull)
+                .toList());
+    var locked =
+        lockTargets(
+            space,
+            request.entries().stream().map(ProposalDecisionRequest.Entry::targetItemId).toList());
+    int documentBytes = 0;
+    for (int i = 0; i < request.entries().size(); i++) {
+      var e = request.entries().get(i);
+      var p = loaded.get(e.proposalId());
+      String path = "entries[" + i + "]";
+      if (e.action() == ProposalAction.UPDATE_SPACE) {
+        spaceInformation.prepare(space, e.expectedSpaceVersion(), e.values());
+        if (requests.hasPendingSpace(space, current.membershipId(), e.expectedSpaceVersion()))
+          throw new ApiException(ProposalErrorCode.CHANGE_REQUEST_ALREADY_PENDING);
+      } else if (p == null) {
+        prepareDirect(space, current.membershipId(), e, locked.get(e.targetItemId()), path);
+        if (e.targetItemId() != null
+            && requests.hasPendingDirect(
+                space,
+                current.membershipId(),
+                e.targetItemId(),
+                e.action().name(),
+                e.expectedItemVersion()))
+          throw new ApiException(ProposalErrorCode.CHANGE_REQUEST_ALREADY_PENDING);
+      } else {
+        validator.prepare(space, current.membershipId(), p, e, locked.get(e.targetItemId()), path);
+        validator.verifyReview(actor, space, p.id(), e.reviewToken());
+        if (requests.hasPending(space, current.membershipId(), p.id()))
+          throw new ApiException(ProposalErrorCode.CHANGE_REQUEST_ALREADY_PENDING);
+      }
+      var document = mapper.createObjectNode();
+      document.set("values", e.values() == null ? mapper.nullNode() : e.values());
+      documentBytes +=
+          CareMutationSizeLimits.bytes(
+              mapper,
+              document,
+              CareMutationSizeLimits.DOCUMENT_BYTES - documentBytes,
+              path + ".values");
+    }
+    // Every entry is checked against the unchanged state before submission documents are written.
+    UUID id = UUID.randomUUID();
+    var now = now();
+    requests.createRequest(space, id, current.membershipId(), now);
+    for (int i = 0; i < request.entries().size(); i++) {
+      var e = request.entries().get(i);
+      var p = loaded.get(e.proposalId());
+      var target = locked.get(e.targetItemId());
+      UUID doc =
+          requests.document(
+              space,
+              e.values(),
+              p == null ? null : p.document(),
+              p == null ? null : p.run(),
+              target == null || e.action() == ProposalAction.DELETE_ITEM ? null : target.document(),
+              now);
+      requests.insertEntry(space, id, UUID.randomUUID(), i, e, doc);
+      if (target != null) leases.releaseAfterSave(space, target.id());
+    }
+    save(command, current.membershipId(), id, now);
+    return requests.submissionResult(space, id);
+  }
+
+  public JsonNode apply(UUID actor, UUID space, JsonNode input) {
+    return decide(actor, space, null, input, "APPLIED");
+  }
+
+  public CareItemAnswerSubmission submitAnswer(UUID actor, UUID space, UUID item, JsonNode input) {
+    validateSize(input);
+    CareMutationInput.object(
+        input, "body", Set.of("answer", "basis", "expectedItemVersion", "clientRequestId"));
+    var key = CareMutationInput.uuid(input.path("clientRequestId"), "clientRequestId", true);
+    long expected =
+        CareMutationInput.version(input.path("expectedItemVersion"), "expectedItemVersion", true);
+    var values =
+        mapper
+            .createObjectNode()
+            .put("answer", CareMutationInput.text(input.path("answer"), "answer", true))
+            .put("basis", CareMutationInput.text(input.path("basis"), "basis", true));
+    CareMutationSizeLimits.bytes(
+        mapper,
+        mapper.createObjectNode().set("values", values),
+        CareMutationSizeLimits.DOCUMENT_BYTES,
+        "body");
+    var logical =
+        mapper
+            .createObjectNode()
+            .put("itemId", item.toString())
+            .put("expectedItemVersion", expected);
+    logical.set("values", values);
+    var command = begin(actor, space, key, "SUBMIT_QUESTION_ANSWER", null, logical);
+    UUID member = access.requireActiveMember(actor, space).membershipId();
+    var target = applications.lock(space, item);
+    if (!target.visible()) throw missing();
+    if (command.previous() != null)
+      return requests.answerSubmissionResult(space, item, replay(command, member));
+    applications.requireOpenQuestion(target, expected);
+    if (requests.hasPendingDirect(
+        space, member, item, ProposalAction.RESOLVE_QUESTION.name(), expected))
+      throw new ApiException(ProposalErrorCode.CHANGE_REQUEST_ALREADY_PENDING);
+
+    var now = now();
+    UUID request = UUID.randomUUID();
+    requests.createRequest(space, request, member, now);
+    var entry =
+        new ProposalDecisionRequest.Entry(
+            null, ProposalAction.RESOLVE_QUESTION, null, item, expected, null, values, null);
+    UUID document = requests.document(space, values, null, null, target.document(), now);
+    requests.insertEntry(space, request, UUID.randomUUID(), 0, entry, document);
+    save(command, member, request, now);
+    return requests.answerSubmissionResult(space, item, request);
+  }
+
+  public JsonNode decline(UUID actor, UUID space, JsonNode input) {
+    return decide(actor, space, null, input, "DECLINED");
+  }
+
+  public JsonNode cancel(UUID actor, UUID space, UUID requestId, JsonNode input) {
+    return decide(actor, space, requestId, input, "CANCELED");
+  }
+
+  private JsonNode decide(UUID actor, UUID space, UUID requestId, JsonNode input, String decision) {
+    validateSize(input);
+    boolean apply = decision.equals("APPLIED"), cancel = decision.equals("CANCELED");
+    var selection = parseSelection(input, apply, cancel);
+    var logical = mapper.createArrayNode();
+    for (var e : selection.entries()) {
+      var l = logical.addObject().put("requestEntryId", e.id().toString());
+      if (apply) {
+        l.put("expectedItemVersion", e.version());
+        if (e.spaceVersion() != null) l.put("expectedSpaceVersion", e.spaceVersion());
+        // Omitted override is not equivalent to an explicit null override.
+        if (e.values() != null) l.set("values", e.values());
+      }
+    }
+    var command =
+        begin(
+            actor, space, selection.key(), "DECIDE_CHANGE_REQUEST_" + decision, requestId, logical);
+    var current =
+        cancel ? access.requireActiveMember(actor, space) : access.requireOwner(actor, space);
+    if (command.previous() != null)
+      return requests.decisionResult(space, replay(command, current.membershipId()));
+    if (cancel) {
+      var header = requests.header(space, requestId).orElseThrow(this::missing);
+      if (!header.memberId().equals(current.membershipId())) throw forbidden();
+    }
+    Map<UUID, ChangeRequestRepository.Entry> entries = new HashMap<>();
+    selection.entries().stream()
+        .map(SelectionEntry::id)
+        .sorted()
+        .forEach(id -> entries.put(id, requests.lock(space, id).orElseThrow(this::missing)));
+    for (var e : entries.values()) {
+      if (cancel && !e.requestId().equals(requestId)) throw missing();
+      if (cancel && !e.memberId().equals(current.membershipId())) throw forbidden();
+      if (!e.status().equals("PENDING")) {
+        if (apply
+            && Set.of("TARGET_VERSION_CHANGED", "SPACE_VERSION_CHANGED")
+                .contains(Objects.toString(e.invalidReason(), "")))
+          throw new ApiException(CommonErrorCode.VERSION_CONFLICT);
+        throw state();
+      }
+    }
+    Map<UUID, ProposalDecisionRepository.Proposal> loaded = Map.of();
+    Map<UUID, LockedItem> locked = Map.of();
+    if (apply) {
+      if (entries.values().stream().filter(e -> e.action().equals("UPDATE_SPACE")).count() > 1)
+        throw batchConflict();
+      var proposalIds =
+          selection.entries().stream()
+              .map(e -> entries.get(e.id()).proposalId())
+              .filter(Objects::nonNull)
+              .toList();
+      if (new HashSet<>(proposalIds).size() != proposalIds.size()) throw batchConflict();
+      loaded = loadProposals(space, proposalIds);
+      locked =
+          lockTargets(
+              space,
+              selection.entries().stream().map(e -> entries.get(e.id()).targetItemId()).toList());
+    }
+    List<DecisionPlan> plans = new ArrayList<>();
+    int documentBytes = 0;
+    for (int i = 0; i < selection.entries().size(); i++) {
+      var chosen = selection.entries().get(i);
+      var e = entries.get(chosen.id());
+      if (!cancel
+          && !ProposalApplicationValidator.matches(reviews.issue(actor, space, e), chosen.token()))
+        throw state();
+      CareItemApplicationService.Prepared prepared = null;
+      if (apply) {
+        if (e.action().equals("UPDATE_SPACE")) {
+          if (chosen.version() != null || chosen.lease() != null)
+            throw CareItemInput.invalid("entries[" + i + "]", "공간 수정에는 항목 버전·잠금을 전달하지 않습니다.");
+          if (chosen.spaceVersion() == null)
+            throw CareItemInput.invalid(
+                "entries[" + i + "].expectedSpaceVersion", "검토한 공간 버전을 입력해주세요.");
+          if (!Objects.equals(chosen.spaceVersion(), e.expectedSpaceVersion()))
+            throw new ApiException(CommonErrorCode.VERSION_CONFLICT);
+          var values = chosen.values() == null ? mapper.readTree(e.values()) : chosen.values();
+          var spacePlan = spaceInformation.prepare(space, chosen.spaceVersion(), values);
+          documentBytes +=
+              CareMutationSizeLimits.bytes(
+                  mapper,
+                  mapper.createObjectNode().put("subjectLabel", spacePlan.label()),
+                  CareMutationSizeLimits.DOCUMENT_BYTES - documentBytes,
+                  "entries[" + i + "].values");
+          plans.add(new DecisionPlan(e, null, spacePlan));
+          continue;
+        }
+        if (chosen.spaceVersion() != null)
+          throw CareItemInput.invalid(
+              "entries[" + i + "].expectedSpaceVersion", "공간 수정에만 공간 버전을 전달해주세요.");
+        if (!Objects.equals(chosen.version(), e.expectedItemVersion())) {
+          if (e.expectedItemVersion() != null && chosen.version() == null)
+            throw CareItemInput.invalid(
+                "entries[" + i + "].expectedItemVersion", "검토한 항목 버전을 입력해주세요.");
+          if (e.expectedItemVersion() == null)
+            throw CareItemInput.invalid("entries[" + i + "]", "생성 요청에는 버전을 전달하지 않습니다.");
+          throw new ApiException(CommonErrorCode.VERSION_CONFLICT);
+        }
+        var proposal = loaded.get(e.proposalId());
+        if (proposal == null && e.action().equals("RESOLVE_QUESTION") && chosen.values() != null)
+          throw CareItemInput.invalid("entries[" + i + "].values", "제출된 답변을 그대로 승인해주세요.");
+        if (e.action().equals("DELETE_ITEM")
+            && chosen.values() != null
+            && !chosen.values().isNull())
+          throw CareItemInput.invalid("entries[" + i + "].values", "삭제에는 values를 전달하지 않습니다.");
+        var values = chosen.values() == null ? mapper.readTree(e.values()) : chosen.values();
+        var operation =
+            new ProposalDecisionRequest.Entry(
+                e.proposalId(),
+                ProposalAction.valueOf(e.action()),
+                null,
+                e.targetItemId(),
+                e.expectedItemVersion(),
+                chosen.lease(),
+                values,
+                null);
+        if (proposal == null
+            && e.action().equals("CREATE_ITEM")
+            && !Objects.equals(
+                mapper.readTree(e.values()).path("itemType"), values.path("itemType")))
+          throw CareItemInput.invalid(
+              "entries[" + i + "].values.itemType", "요청의 항목 유형을 변경할 수 없습니다.");
+        prepared =
+            proposal == null
+                ? prepareDirect(
+                    space,
+                    current.membershipId(),
+                    operation,
+                    locked.get(e.targetItemId()),
+                    "entries[" + i + "]")
+                : validator.prepare(
+                    space,
+                    current.membershipId(),
+                    proposal,
+                    operation,
+                    locked.get(e.targetItemId()),
+                    "entries[" + i + "]");
+        if (!Set.of("LINK_EVIDENCE", "DELETE_ITEM").contains(e.action())) {
+          CareMutationSizeLimits.strings(prepared.body(), "entries[" + i + "].values");
+          documentBytes +=
+              CareMutationSizeLimits.bytes(
+                  mapper,
+                  prepared.body(),
+                  CareMutationSizeLimits.DOCUMENT_BYTES - documentBytes,
+                  "entries[" + i + "].values");
+        }
+      }
+      plans.add(new DecisionPlan(e, prepared, null));
+    }
+    UUID batch = UUID.randomUUID();
+    var now = now();
+    requests.batch(space, batch, current.membershipId(), decision, now);
+    if (apply && !loaded.isEmpty())
+      proposals.batch(batch, space, current.membershipId(), true, now);
+    for (int i = 0; i < plans.size(); i++) {
+      var plan = plans.get(i);
+      var e = plan.entry();
+      if (apply) {
+        if (plan.spacePrepared() != null) {
+          var result = spaceInformation.apply(space, plan.spacePrepared(), now);
+          requests.decideSpace(space, e.id(), batch, result.version(), result.document());
+          continue;
+        }
+        var p = loaded.get(e.proposalId());
+        var result =
+            p == null
+                ? applications.applyDirect(
+                    space,
+                    current.membershipId(),
+                    plan.prepared(),
+                    e.documentId(),
+                    e.memberId(),
+                    e.submittedAt(),
+                    now)
+                : applications.apply(
+                    space,
+                    current.membershipId(),
+                    plan.prepared(),
+                    p.document(),
+                    p.evidence(),
+                    p.run(),
+                    now);
+        // LINK reuses the old document; linking it to its own descendant would create a cycle.
+        if (p != null && !e.action().equals("LINK_EVIDENCE"))
+          requests.linkAppliedDocument(space, result.document(), e.documentId());
+        if (p != null)
+          proposals.decision(
+              space, batch, i, p.id(), result.item(), result.version(), result.document());
+        // Keep the item document reference for history; LINK has no applied values to expose.
+        requests.decide(
+            space, e.id(), batch, decision, result.item(), result.version(), result.document());
+        if (e.targetItemId() != null) leases.releaseAfterSave(space, e.targetItemId());
+      } else requests.decide(space, e.id(), batch, decision, null, null, null);
+    }
+    save(command, current.membershipId(), batch, now);
+    return requests.decisionResult(space, batch);
+  }
+
+  private CareItemApplicationService.Prepared prepareDirect(
+      UUID space, UUID member, ProposalDecisionRequest.Entry e, LockedItem target, String path) {
+    if (e.action() == ProposalAction.CREATE_ITEM) {
+      if (target != null || e.expectedItemVersion() != null || e.leaseToken() != null)
+        throw CareItemInput.invalid(path, "생성에는 대상·버전·잠금을 전달하지 않습니다.");
+    } else {
+      if (target == null || e.expectedItemVersion() == null)
+        throw CareItemInput.invalid(path, "수정할 대상과 버전을 입력해주세요.");
+      if (e.action() == ProposalAction.DELETE_ITEM) {
+        if (e.values() != null && !e.values().isNull())
+          throw CareItemInput.invalid(path + ".values", "삭제에는 values를 전달하지 않습니다.");
+        var deletion = applications.prepareDeletion(target, e.expectedItemVersion());
+        leases.requireForDeletion(space, target.id(), member, e.leaseToken());
+        return deletion;
+      }
+      applications.requireEditable(target, e.expectedItemVersion());
+      leases.requireForWrite(space, target.id(), member, e.leaseToken());
+      if (e.action() == ProposalAction.RESOLVE_QUESTION)
+        return applications.prepareAnswer(
+            space, target, e.values().path("answer"), path + ".values");
+    }
+    return applications.prepareDirect(space, target, e.values(), path + ".values");
+  }
+
+  private Map<UUID, ProposalDecisionRepository.Proposal> loadProposals(UUID space, List<UUID> ids) {
+    Map<UUID, ProposalDecisionRepository.Proposal> out = new HashMap<>();
+    ids.stream()
+        .sorted()
+        .forEach(id -> out.put(id, proposals.lock(space, id).orElseThrow(this::missing)));
+    return out;
+  }
+
+  private Map<UUID, LockedItem> lockTargets(UUID space, List<UUID> ids) {
+    Set<UUID> targets = new HashSet<>();
+    for (UUID id : ids) if (id != null && !targets.add(id)) throw batchConflict();
+    Map<UUID, LockedItem> out = new HashMap<>();
+    targets.stream().sorted().forEach(id -> out.put(id, applications.lock(space, id)));
+    return out;
+  }
+
+  private Selection parseSelection(JsonNode input, boolean apply, boolean cancel) {
+    CareMutationInput.object(input, "body", Set.of("clientRequestId", "entries"));
+    UUID key = CareMutationInput.uuid(input.path("clientRequestId"), "clientRequestId", true);
+    var array = input.path("entries");
+    if (!array.isArray() || array.isEmpty() || array.size() > 20)
+      throw CareItemInput.invalid("entries", "요청을 1개 이상 20개 이하로 선택해주세요.");
+    List<SelectionEntry> result = new ArrayList<>();
+    Set<UUID> ids = new HashSet<>();
+    for (int i = 0; i < array.size(); i++) {
+      var e = array.get(i);
+      String path = "entries[" + i + "]";
+      CareMutationInput.object(
+          e,
+          path,
+          apply
+              ? Set.of(
+                  "requestEntryId",
+                  "reviewToken",
+                  "expectedItemVersion",
+                  "expectedSpaceVersion",
+                  "leaseToken",
+                  "values")
+              : cancel ? Set.of("requestEntryId") : Set.of("requestEntryId", "reviewToken"));
+      UUID id = CareMutationInput.uuid(e.path("requestEntryId"), path + ".requestEntryId", true);
+      if (!ids.add(id))
+        throw CareItemInput.invalid(path + ".requestEntryId", "같은 요청 항목을 두 번 선택할 수 없습니다.");
+      String token =
+          cancel
+              ? null
+              : CareMutationInput.text(e.path("reviewToken"), path + ".reviewToken", true);
+      if (token != null && !token.matches("[0-9a-f]{64}"))
+        throw CareItemInput.invalid(path + ".reviewToken", "상세 조회의 검토 확인값을 전달해주세요.");
+      result.add(
+          new SelectionEntry(
+              id,
+              token,
+              CareMutationInput.version(
+                  e.path("expectedItemVersion"), path + ".expectedItemVersion", false),
+              CareMutationInput.text(e.path("leaseToken"), path + ".leaseToken", false),
+              e.has("values") ? e.get("values") : null,
+              CareMutationInput.version(
+                  e.path("expectedSpaceVersion"), path + ".expectedSpaceVersion", false)));
+    }
+    return new Selection(key, List.copyOf(result));
+  }
+
+  private Command begin(
+      UUID actor, UUID space, UUID key, String kind, UUID request, JsonNode logical) {
+    String scope = "SPACE:" + space + (request == null ? "" : ":REQUEST:" + request);
+    String digest =
+        digests.digest(
+            kind,
+            scope,
+            actor.toString(),
+            mapper.writeValueAsString(CommandJson.canonical(mapper, logical)));
+    if (!receipts.tryLock(actor, key)) throw new ApiException(CommonErrorCode.REQUEST_IN_PROGRESS);
+    var previous = receipts.find(actor, key).orElse(null);
+    if (previous != null
+        && (!previous.commandKind().equals(kind)
+            || !previous.scopeKey().equals(scope)
+            || !previous.requestDigest().equals(digest)))
+      throw new ApiException(CommonErrorCode.IDEMPOTENCY_KEY_REUSED);
+    return new Command(actor, key, kind, scope, digest, previous);
+  }
+
+  private UUID replay(Command command, UUID member) {
+    if (!member.toString().equals(command.previous().resultRefs().get("membershipId")))
+      throw forbidden();
+    return UUID.fromString(command.previous().resultRefs().get("resultId"));
+  }
+
+  private void save(Command c, UUID member, UUID id, Instant now) {
+    receipts.saveSuccess(
+        c.actor(),
+        c.key(),
+        new CommandReceipt(
+            c.kind(),
+            c.scope(),
+            c.digest(),
+            Map.of("resultId", id.toString(), "membershipId", member.toString())),
+        now);
+  }
+
+  private void validateSize(JsonNode input) {
+    CareMutationSizeLimits.strings(input, "body");
+    CareMutationSizeLimits.bytes(mapper, input, CareMutationSizeLimits.REQUEST_BYTES, "body");
+  }
+
+  private Instant now() {
+    return clock.instant().truncatedTo(ChronoUnit.MICROS);
+  }
+
+  private String text(UUID id) {
+    return id == null ? null : id.toString();
+  }
+
+  private ApiException missing() {
+    return new ApiException(CommonErrorCode.RESOURCE_NOT_FOUND);
+  }
+
+  private ApiException forbidden() {
+    return new ApiException(CommonErrorCode.FORBIDDEN);
+  }
+
+  private ApiException state() {
+    return new ApiException(ProposalErrorCode.CHANGE_REQUEST_STATE_CONFLICT);
+  }
+
+  private ApiException batchConflict() {
+    return new ApiException(ProposalErrorCode.PROPOSAL_BATCH_CONFLICT);
+  }
+
+  private record Command(
+      UUID actor, UUID key, String kind, String scope, String digest, CommandReceipt previous) {}
+
+  private record Selection(UUID key, List<SelectionEntry> entries) {}
+
+  private record SelectionEntry(
+      UUID id, String token, Long version, String lease, JsonNode values, Long spaceVersion) {
+    @Override
+    public String toString() {
+      return "RequestSelection[id=" + id + "]";
+    }
+  }
+
+  private record DecisionPlan(
+      ChangeRequestRepository.Entry entry,
+      CareItemApplicationService.Prepared prepared,
+      CareSpaceInformationApplicationService.Prepared spacePrepared) {}
+}

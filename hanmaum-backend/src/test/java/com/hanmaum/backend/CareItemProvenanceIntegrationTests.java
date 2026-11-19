@@ -1,0 +1,1267 @@
+package com.hanmaum.backend;
+
+import static org.assertj.core.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
+import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.*;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
+
+import com.hanmaum.backend.ai.dto.CareItemType;
+import com.hanmaum.backend.ai.dto.v2.AiV2AnalysisResponse;
+import com.hanmaum.backend.ai.dto.v2.AiV2AnalysisResponse.*;
+import com.hanmaum.backend.analysis.service.AnalysisExecutionService;
+import com.hanmaum.backend.careitem.dto.*;
+import com.hanmaum.backend.careitem.repository.CareContentRedactionRepository;
+import com.hanmaum.backend.careitem.repository.CareItemProvenanceRepository;
+import com.hanmaum.backend.careitem.service.*;
+import com.hanmaum.backend.carespace.dto.CreateCareSpaceRequest;
+import com.hanmaum.backend.carespace.service.CareSpaceCreationService;
+import com.hanmaum.backend.global.command.CommandReceiptRepository;
+import com.hanmaum.backend.global.security.oauth.MemberOAuth2User;
+import com.hanmaum.backend.proposal.service.*;
+import com.hanmaum.backend.record.dto.CreateSourceRecordRequest;
+import com.hanmaum.backend.record.dto.CreateSourceRecordResponse;
+import com.hanmaum.backend.record.service.SourceRecordCreationService;
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.*;
+import org.junit.jupiter.api.*;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
+import org.springframework.context.annotation.Import;
+import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.oauth2.client.authentication.OAuth2AuthenticationToken;
+import org.springframework.security.oauth2.core.user.DefaultOAuth2User;
+import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
+import org.springframework.test.util.AopTestUtils;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.ResultActions;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
+import tools.jackson.databind.*;
+import tools.jackson.databind.node.ObjectNode;
+
+@SpringBootTest(
+    properties = {
+      "app.analysis.contract-version=v2",
+      "app.analysis.worker.enabled=false",
+      "app.ai.v2.max-request-bytes=1048576",
+      "app.ai.v2.max-response-bytes=524288"
+    })
+@ActiveProfiles("test")
+@AutoConfigureMockMvc
+@Import(TestcontainersConfiguration.class)
+class CareItemProvenanceIntegrationTests {
+  @Autowired JdbcTemplate db;
+  @Autowired MockMvc mvc;
+  @Autowired ObjectMapper mapper;
+  @Autowired CareSpaceCreationService spaces;
+  @Autowired CareItemCreationService create;
+  @Autowired DirectCareItemUpdateService update;
+  @Autowired EditLockService locks;
+  @Autowired SourceRecordCreationService records;
+  @Autowired AnalysisExecutionService execution;
+  @Autowired ProposalQueryService proposals;
+  @Autowired ProposalDecisionService decisions;
+  @Autowired ChangeRequestService requests;
+  @Autowired ChangeRequestQueryService requestQueries;
+  @Autowired CareContentRedactionRepository redactions;
+  @Autowired PlatformTransactionManager transactions;
+  @MockitoSpyBean CareItemProvenanceRepository repository;
+  @MockitoSpyBean CommandReceiptRepository receipts;
+  UUID owner, member, space, ownerMembership, membership;
+
+  @BeforeEach
+  void setup() {
+    owner = user("소유자");
+    member = user("수진");
+    space = spaces.create(owner, new CreateCareSpaceRequest("돌봄", UUID.randomUUID())).spaceId();
+    ownerMembership =
+        db.queryForObject(
+            "SELECT owner_membership_id FROM care_space WHERE id=?", UUID.class, space);
+    membership = UUID.randomUUID();
+    db.update(
+        "INSERT INTO space_membership(id,space_id,user_id,joined_at) VALUES (?,?,?,now())",
+        membership,
+        space,
+        member);
+  }
+
+  @Test
+  void directInputAndInitialHistoryPreserveValuesAndMetadata() throws Exception {
+    UUID item = schedule("  직접 입력\n그대로 💚  ");
+    var evidence = data(member, item, "/evidence").path("items");
+    assertThat(evidence.size()).isOne();
+    var first = evidence.get(0);
+    assertThat(first.path("kind").asText()).isEqualTo("DIRECT_INPUT");
+    assertThat(first.path("status").asText()).isEqualTo("VALID");
+    assertThat(first.path("recordId").isNull()).isTrue();
+    assertThat(mapper.readTree(first.path("text").asText()).path("title").asText())
+        .isEqualTo("  직접 입력\n그대로 💚  ");
+    assertThat(first.path("createdByMembershipId").asText()).isEqualTo(ownerMembership.toString());
+    assertThat(first.path("fieldPaths").isEmpty()).isTrue();
+    var history = data(member, item, "/history").path("items");
+    assertThat(history.size()).isOne();
+    assertThat(history.get(0).path("changeKind").asText()).isEqualTo("CREATE");
+    assertThat(history.get(0).at("/changedBy/displayName").asText()).isEqualTo("소유자");
+    var detail = data(member, item, "/history/1");
+    assertThat(detail.path("previousVersion").isNull()).isTrue();
+    assertThat(detail.path("before").isNull()).isTrue();
+    assertThat(detail.at("/after/title").asText()).isEqualTo("  직접 입력\n그대로 💚  ");
+    assertThat(detail.at("/after/status").asText()).isEqualTo("SCHEDULED");
+    assertThat(detail.path("evidenceIds").get(0)).isEqualTo(first.path("evidenceId"));
+  }
+
+  @Test
+  void actualContentAndStatusWritesHaveSeparateVersionsAndDerivedInputs() throws Exception {
+    UUID item = schedule("처음");
+    var edit = command(owner, item, 1);
+    edit.putObject("values").put("title", "수정");
+    update.update(owner, space, item, edit, false);
+    update.update(owner, space, item, command(owner, item, 2).put("status", "COMPLETED"), true);
+    var history = data(member, item, "/history").path("items");
+    assertThat(history).extracting(n -> n.path("version").asText()).containsExactly("3", "2", "1");
+    assertThat(history)
+        .extracting(n -> n.path("changeKind").asText())
+        .containsExactly("STATUS_CHANGE", "UPDATE", "CREATE");
+    var detail = data(member, item, "/history/2");
+    assertThat(detail.at("/before/title").asText()).isEqualTo("처음");
+    assertThat(detail.at("/after/title").asText()).isEqualTo("수정");
+    var evidence = data(member, item, "/evidence").path("items");
+    assertThat(evidence)
+        .extracting(n -> n.path("kind").asText())
+        .containsExactly("DIRECT_INPUT", "DERIVED", "DERIVED");
+    assertThat(detail.path("evidenceIds"))
+        .extracting(JsonNode::asText)
+        .containsExactly(evidence.get(1).path("evidenceId").asText());
+    assertThat(data(member, item, "/history/1").path("evidenceIds"))
+        .extracting(JsonNode::asText)
+        .containsExactly(evidence.get(0).path("evidenceId").asText());
+  }
+
+  @Test
+  void withdrawnAndFormerParticipantsAreDifferentAndPastAssignmentsRemainHistorical()
+      throws Exception {
+    UUID item =
+        create
+            .create(
+                owner,
+                space,
+                new CreateCareItemRequest(
+                    "TASK",
+                    "할 일",
+                    null,
+                    new CreateCareItemRequest.TaskFields(null, membership.toString()),
+                    UUID.randomUUID()))
+            .itemId();
+    update.update(member, space, item, command(member, item, 1).put("status", "IN_PROGRESS"), true);
+    db.update(
+        "UPDATE space_membership SET ended_at=now(),end_reason='LEFT' WHERE id=?", membership);
+    var previous = data(owner, item, "/history/2");
+    assertThat(previous.at("/changedBy/withdrawn").asBoolean()).isFalse();
+    assertThat(previous.at("/changedBy/displayName").asText()).isEqualTo("수진");
+    assertThat(previous.at("/before/fields/assigneeMembershipId").asText())
+        .isEqualTo(membership.toString());
+    db.update("UPDATE space_membership SET user_id=NULL WHERE id=?", membership);
+    var withdrawn = data(owner, item, "/history/2");
+    assertThat(withdrawn.at("/changedBy/withdrawn").asBoolean()).isTrue();
+    assertThat(withdrawn.at("/changedBy/membershipId").isNull()).isTrue();
+    assertThat(withdrawn.at("/changedBy/displayName").isNull()).isTrue();
+  }
+
+  @Test
+  void emptyRetainedLinksAndHistoryDoNotBypassAuthorization() throws Exception {
+    UUID item = schedule("항목");
+    db.update("DELETE FROM care_item_basis WHERE item_id=?", item);
+    assertThat(data(member, item, "/evidence").path("items").isEmpty()).isTrue();
+    db.update("DELETE FROM care_item_history WHERE item_id=?", item);
+    assertThat(data(member, item, "/history").path("items").isEmpty()).isTrue();
+    mvc.perform(get(path(item, "/history/1")).with(authentication(login(member))))
+        .andExpect(status().isNotFound());
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"/evidence", "/history", "/history/1"})
+  void enforcesSessionCurrentMembershipAndSameSpace(String suffix) throws Exception {
+    UUID item = schedule("다른 공간에서 못 읽음");
+    mvc.perform(get(path(item, suffix))).andExpect(status().isUnauthorized());
+    mvc.perform(get(path(item, suffix)).with(authentication(login(user("비참여자")))))
+        .andExpect(status().isForbidden());
+    var other =
+        spaces.create(member, new CreateCareSpaceRequest("다른 공간", UUID.randomUUID())).spaceId();
+    mvc.perform(
+            get("/api/spaces/" + other + "/items/" + item + suffix)
+                .with(authentication(login(member))))
+        .andExpect(status().isNotFound());
+    mvc.perform(get(path(UUID.randomUUID(), suffix)).with(authentication(login(member))))
+        .andExpect(status().isNotFound());
+    db.update(
+        "UPDATE space_membership SET ended_at=now(),end_reason='LEFT' WHERE id=?", membership);
+    mvc.perform(get(path(item, suffix)).with(authentication(login(member))))
+        .andExpect(status().isForbidden());
+    db.update("UPDATE care_space SET lifecycle='DELETING' WHERE id=?", space);
+    mvc.perform(get(path(item, suffix)).with(authentication(login(owner))))
+        .andExpect(status().isNotFound());
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"0", "01", "-1", "1.0", "not-a-version", "9223372036854775808"})
+  void rejectsInvalidVersionWithoutCoercion(String version) throws Exception {
+    UUID item = schedule("버전");
+    mvc.perform(get(path(item, "/history/" + version)).with(authentication(login(member))))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.code").value("INVALID_REQUEST"));
+  }
+
+  @Test
+  void erasedAncestorHidesCopiedContentEvenBeforePhysicalDependentErasure() throws Exception {
+    UUID item = schedule("삭제할 원문");
+    UUID root = document(item);
+    var edit = command(owner, item, 1);
+    edit.putObject("values").put("title", "복사된 변경 제목");
+    update.update(owner, space, item, edit, false);
+    db.update("UPDATE content_document SET body=NULL,redacted_at=now() WHERE id=?", root);
+    var detail = data(member, item, "/history/2");
+    assertThat(detail.path("before").isNull()).isTrue();
+    assertThat(detail.path("after").isNull()).isTrue();
+    assertThat(detail.path("evidenceIds").isEmpty()).isTrue();
+    assertThat(data(member, item, "/history/1").path("evidenceIds").isEmpty()).isTrue();
+    assertThat(detail.path("redactedFields"))
+        .extracting(JsonNode::asText)
+        .containsExactly("before", "after");
+    assertThat(detail.at("/changedBy/displayName").asText()).isEqualTo("소유자");
+    var evidence = data(member, item, "/evidence");
+    assertThat(evidence.path("items"))
+        .allSatisfy(
+            row -> {
+              assertThat(row.path("status").asText()).isEqualTo("REDACTED");
+              assertThat(row.path("text").isNull()).isTrue();
+            });
+    assertThat(detail.toString() + evidence + data(member, item, "/history"))
+        .doesNotContain("삭제할 원문", "복사된 변경 제목");
+  }
+
+  @Test
+  void independentLaterDocumentIsNotHiddenByRedactedPastVersionOrGeneralDeletion()
+      throws Exception {
+    UUID item = schedule("과거 내용");
+    UUID original = document(item), fresh = UUID.randomUUID();
+    db.update("UPDATE content_document SET body=NULL,redacted_at=now() WHERE id=?", original);
+    db.update(
+        "INSERT INTO content_document(id,space_id,kind,body,created_at) VALUES (?,?,'DIRECT_INPUT',?::jsonb,now())",
+        fresh,
+        space,
+        "{\"title\":\"새로 확인한 사실\",\"fields\":{}}");
+    db.update(
+        "INSERT INTO care_item_history(space_id,item_id,version,operation,document_id,status,changed_by_membership_id,changed_at) VALUES (?,?,2,'UPDATE',?,'SCHEDULED',?,now())",
+        space,
+        item,
+        fresh,
+        ownerMembership);
+    db.update(
+        "UPDATE care_item SET version=2,current_document_id=?,visibility='DELETED' WHERE id=?",
+        fresh,
+        item);
+    var detail = data(member, item, "/history/2");
+    assertThat(detail.path("before").isNull()).isTrue();
+    assertThat(detail.at("/after/title").asText()).isEqualTo("새로 확인한 사실");
+    assertThat(detail.path("redactedFields"))
+        .extracting(JsonNode::asText)
+        .containsExactly("before");
+    assertThat(data(member, item, "/history").path("items").size()).isEqualTo(2);
+  }
+
+  @Test
+  void quoteShowsOriginalAuthorAndTimeAndErasedOrVersionChangedSourceNeverLeaks() throws Exception {
+    UUID item = schedule("독립 직접 입력");
+    var source =
+        records.create(member, space, new CreateSourceRecordRequest("새 소식 원문", UUID.randomUUID()));
+    UUID evidence = UUID.randomUUID();
+    db.update(
+        "INSERT INTO evidence(id,space_id,record_id,record_version,quote,created_at) VALUES (?,?,?,1,'소식 원문',now())",
+        evidence,
+        space,
+        source.recordId());
+    db.update(
+        "INSERT INTO care_item_basis(id,space_id,item_id,source_evidence_id,submitted_by_membership_id,created_at) VALUES (?,?,?,?,?,now()+interval '1 hour')",
+        UUID.randomUUID(),
+        space,
+        item,
+        evidence,
+        ownerMembership);
+    var quote = data(member, item, "/evidence").at("/items/1");
+    assertThat(quote.path("evidenceId").asText()).isEqualTo(evidence.toString());
+    assertThat(quote.path("createdByMembershipId").asText()).isEqualTo(membership.toString());
+    assertThat(quote.path("createdAt").asText()).isEqualTo(source.recordedAt().toString());
+    assertThat(quote.path("text").asText()).isEqualTo("소식 원문");
+    assertThat(data(member, item, "/history/1").path("evidenceIds"))
+        .extracting(JsonNode::asText)
+        .doesNotContain(evidence.toString());
+    db.update("UPDATE source_record SET version=2 WHERE id=?", source.recordId());
+    var blocked = data(member, item, "/evidence").at("/items/1");
+    assertThat(blocked.path("text").isNull()).isTrue();
+    assertThat(blocked.path("recordId").isNull()).isTrue();
+    db.update(
+        "UPDATE source_record SET version=1,lifecycle='ERASED',body=NULL,recorded_at=NULL,erased_at=now() WHERE id=?",
+        source.recordId());
+    assertThat(data(member, item, "/evidence").toString()).doesNotContain("소식 원문");
+    assertThat(data(member, item, "/evidence").at("/items/1/createdAt").isNull()).isTrue();
+    assertThat(data(member, item, "/evidence").at("/items/0/status").asText()).isEqualTo("VALID");
+  }
+
+  @Test
+  void ownerReconfirmsErasedItemWithNewValuesAndReleasesOnlyTheReconfirmationLock()
+      throws Exception {
+    var source = propose("CREATE", null);
+    UUID item = apply(source, null);
+    executeDeletion(source.recordId(), deletionBody(deletionImpact(source.recordId())))
+        .andExpect(status().isOk());
+    String lock = "{\"expectedItemVersion\":\"2\",\"purpose\":\"RECONFIRMATION\"}";
+    postItem(member, item, "/edit-lock", mapper.readTree(lock)).andExpect(status().isForbidden());
+    postItem(owner, item, "/edit-lock", mapper.readTree("{\"expectedItemVersion\":\"2\"}"))
+        .andExpect(status().isNotFound());
+    String token = acquireReconfirmation(item, "2");
+    var renewal =
+        mapper.createObjectNode().put("leaseToken", token).put("purpose", "RECONFIRMATION");
+    postItem(owner, item, "/edit-lock/renewals", renewal).andExpect(status().isOk());
+    var body = reconfirmationBody("2", token, "새로 확인한 일정");
+    body.withObject("/values/fields").put("scheduledDate", "2099-01-01");
+    postItem(member, item, "/reconfirmations", body).andExpect(status().isForbidden());
+    postItem(owner, item, "/reconfirmations", body.deepCopy().put("expectedItemVersion", "1"))
+        .andExpect(status().isConflict())
+        .andExpect(jsonPath("$.code").value("VERSION_CONFLICT"));
+    db.update(
+        "UPDATE care_item_edit_lock SET expires_at=clock_timestamp()-interval '1 second' WHERE item_id=?",
+        item);
+    postItem(owner, item, "/reconfirmations", body)
+        .andExpect(status().isConflict())
+        .andExpect(jsonPath("$.code").value("EDIT_LOCK_EXPIRED"));
+    body.put("leaseToken", acquireReconfirmation(item, "2"));
+    var result =
+        responseData(
+            postItem(owner, item, "/reconfirmations", body)
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.needsReconfirmation").value(false)));
+    assertThat(result.path("version").asText()).isEqualTo("3");
+    assertThat(
+            responseData(
+                postItem(owner, item, "/reconfirmations", body).andExpect(status().isOk())))
+        .isEqualTo(result);
+    assertThat(
+            db.queryForObject(
+                "SELECT count(*) FROM care_item_edit_lock WHERE item_id=?", Integer.class, item))
+        .isZero();
+    var detail = data(owner, item, "");
+    assertThat(detail.path("title").asText()).isEqualTo("새로 확인한 일정");
+    assertThat(detail.path("status").asText()).isEqualTo("SCHEDULED");
+    var history = data(owner, item, "/history/3");
+    assertThat(history.path("before").isNull()).isTrue();
+    assertThat(history.path("evidenceIds").size()).isOne();
+    assertThat(data(owner, item, "/history").at("/items/0/changeKind").asText())
+        .isEqualTo("RECONFIRM");
+    assertThat(data(owner, item, "/evidence").at("/items/0/kind").asText())
+        .isEqualTo("RECONFIRMATION");
+    var dashboard =
+        responseData(
+            mvc.perform(
+                    get("/api/spaces/" + space + "/dashboard").with(authentication(login(owner))))
+                .andExpect(status().isOk()));
+    assertThat(dashboard.at("/upcomingSchedules/items/0/title").asText()).isEqualTo("새로 확인한 일정");
+  }
+
+  @Test
+  void reconfirmationKeepsSelectedQuoteProvenanceForSubsequentSourceDeletion() throws Exception {
+    UUID item = schedule("일정");
+    var source = propose("LINK_EVIDENCE", item);
+    apply(source, item);
+    db.update("UPDATE care_item SET needs_reconfirmation=TRUE WHERE id=?", item);
+    var body = reconfirmationBody("2", acquireReconfirmation(item, "2"), "재확인한 일정");
+    UUID otherSpace =
+        spaces.create(owner, new CreateCareSpaceRequest("다른 공간", UUID.randomUUID())).spaceId();
+    UUID otherItem =
+        create
+            .create(
+                owner,
+                otherSpace,
+                new CreateCareItemRequest(
+                    "SCHEDULE",
+                    "다른 공간 일정",
+                    null,
+                    new ScheduleFields(null, null, null),
+                    UUID.randomUUID()))
+            .itemId();
+    String foreignEvidence =
+        db.queryForObject(
+                "SELECT id FROM care_item_basis WHERE space_id=? AND item_id=?",
+                UUID.class,
+                otherSpace,
+                otherItem)
+            .toString();
+    body.putArray("evidenceIds").add(foreignEvidence);
+    postItem(owner, item, "/reconfirmations", body)
+        .andExpect(status().isConflict())
+        .andExpect(jsonPath("$.code").value("ITEM_STATE_CONFLICT"));
+    String quote = data(owner, item, "/evidence").at("/items/1/evidenceId").asText();
+    String originalInput = data(owner, item, "/evidence").at("/items/0/evidenceId").asText();
+    body.putArray("evidenceIds").add(quote);
+    var noBasis = body.deepCopy().putNull("basis");
+    postItem(owner, item, "/reconfirmations", noBasis).andExpect(status().isBadRequest());
+    postItem(owner, item, "/reconfirmations", body).andExpect(status().isOk());
+    assertThat(data(owner, item, "/history/3").path("evidenceIds").toString()).contains(quote);
+    assertThat(data(owner, item, "/evidence").toString()).contains(originalInput);
+    var next =
+        records.create(owner, space, new CreateSourceRecordRequest("다음 소식", UUID.randomUUID()));
+    var nextRun = next.analysis().analysisId();
+    var work = execution.claim(space, nextRun, Duration.ofMinutes(2)).orElseThrow();
+    var candidate =
+        work.v2Request().candidates().stream()
+            .filter(value -> value.itemId().equals(item))
+            .findFirst()
+            .orElseThrow();
+    assertThat(candidate.basis()).hasSize(2);
+    assertThat(
+            db.queryForObject(
+                "SELECT count(*) FROM analysis_input_basis WHERE run_id=? AND source_evidence_id=?",
+                Integer.class,
+                nextRun,
+                UUID.fromString(quote)))
+        .isOne();
+    assertThat(
+            db.queryForObject(
+                "SELECT count(*) FROM analysis_input_basis WHERE run_id=? AND basis_id=?",
+                Integer.class,
+                nextRun,
+                UUID.fromString(originalInput)))
+        .isZero();
+    executeDeletion(source.recordId(), deletionBody(deletionImpact(source.recordId())))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.data.reconfirmationItemIds[0]").value(item.toString()));
+    assertThat(data(owner, item, "").path("title").isNull()).isTrue();
+    assertThat(data(owner, item, "/evidence").toString()).doesNotContain("재확인한 일정", "직접 통화해 확인함");
+    var erased = reconfirmationBody("4", acquireReconfirmation(item, "4"), "다시 확인한 일정");
+    erased.putArray("evidenceIds").add(quote);
+    postItem(owner, item, "/reconfirmations", erased)
+        .andExpect(status().isConflict())
+        .andExpect(jsonPath("$.code").value("ITEM_STATE_CONFLICT"));
+  }
+
+  @Test
+  void v1CandidateKeepsTheReconfirmedItemWithoutCapturingItsUnselectedQuote() throws Exception {
+    UUID item = schedule("기존 일정");
+    var source = propose("LINK_EVIDENCE", item);
+    apply(source, item);
+    db.update("UPDATE care_item SET needs_reconfirmation=TRUE WHERE id=?", item);
+    postItem(
+            owner,
+            item,
+            "/reconfirmations",
+            reconfirmationBody("2", acquireReconfirmation(item, "2"), "독립적으로 확인한 일정"))
+        .andExpect(status().isOk());
+
+    var next =
+        records.create(owner, space, new CreateSourceRecordRequest("다음 소식", UUID.randomUUID()));
+    UUID run = next.analysis().analysisId();
+    db.update("UPDATE analysis_run SET contract_version='v1' WHERE id=?", run);
+    var work = execution.claim(space, run, Duration.ofMinutes(2)).orElseThrow();
+    assertThat(work.request().candidates()).extracting(value -> value.itemId()).contains(item);
+    assertThat(
+            db.queryForObject(
+                "SELECT cardinality(source_evidence_ids) FROM analysis_input_item WHERE run_id=? AND item_id=?",
+                Integer.class,
+                run,
+                item))
+        .isZero();
+    assertThat(
+            db.queryForObject(
+                "SELECT count(*) FROM analysis_input_source WHERE run_id=? AND source_record_id=?",
+                Integer.class,
+                run,
+                source.recordId()))
+        .isZero();
+  }
+
+  @Test
+  void reconfirmedItemStaysAvailableAfterLegacyRedactionAndSkipsItsOldQuoteInAnalysis()
+      throws Exception {
+    var source = propose("CREATE", null);
+    UUID item = apply(source, null);
+    UUID quote =
+        db.queryForObject(
+            "SELECT source_evidence_id FROM care_item_basis WHERE item_id=?", UUID.class, item);
+    db.update("UPDATE evidence SET quote=NULL,redacted_at=clock_timestamp() WHERE id=?", quote);
+    db.update("UPDATE care_item SET needs_reconfirmation=TRUE WHERE id=?", item);
+    postItem(
+            owner,
+            item,
+            "/reconfirmations",
+            reconfirmationBody("1", acquireReconfirmation(item, "1"), "독립적으로 확인한 일정"))
+        .andExpect(status().isOk());
+
+    new TransactionTemplate(transactions).executeWithoutResult(tx -> redactions.propagate(space));
+
+    assertThat(data(owner, item, "").path("needsReconfirmation").asBoolean()).isFalse();
+    assertThat(data(owner, item, "").path("title").asText()).isEqualTo("독립적으로 확인한 일정");
+    var next =
+        records.create(owner, space, new CreateSourceRecordRequest("다음 소식", UUID.randomUUID()));
+    var work =
+        execution.claim(space, next.analysis().analysisId(), Duration.ofMinutes(2)).orElseThrow();
+    var candidate =
+        work.v2Request().candidates().stream()
+            .filter(value -> value.itemId().equals(item))
+            .findFirst()
+            .orElseThrow();
+    assertThat(candidate.basis()).hasSize(1);
+    assertThat(candidate.basis().getFirst().basisId()).isNotEqualTo(quote);
+  }
+
+  @Test
+  void reconfirmationWithOnlyExistingEvidenceRequiresMatchingIndependentValues() throws Exception {
+    UUID item = schedule("독립 일정");
+    String direct = data(owner, item, "/evidence").at("/items/0/evidenceId").asText();
+    db.update("UPDATE care_item SET needs_reconfirmation=TRUE WHERE id=?", item);
+    var body = reconfirmationBody("1", acquireReconfirmation(item, "1"), "다른 값").putNull("basis");
+    body.putArray("evidenceIds").add(direct);
+    postItem(owner, item, "/reconfirmations", body).andExpect(status().isBadRequest());
+    body.withObject("/values").put("title", "독립 일정");
+    postItem(owner, item, "/reconfirmations", body).andExpect(status().isOk());
+    assertThat(data(owner, item, "/history/2").path("evidenceIds").toString()).contains(direct);
+  }
+
+  @Test
+  void reconfirmingQuestionsPreservesTheExistingAnswerStatus() throws Exception {
+    UUID item =
+        create
+            .create(
+                owner,
+                space,
+                new CreateCareItemRequest(
+                    "QUESTION",
+                    "확인할 질문",
+                    null,
+                    new CreateCareItemRequest.QuestionFields(),
+                    UUID.randomUUID()))
+            .itemId();
+    db.update("UPDATE care_item SET needs_reconfirmation=TRUE WHERE id=?", item);
+    var body = reconfirmationBody("1", acquireReconfirmation(item, "1"), "다시 확인한 질문");
+    body.withObject("/values/fields").put("confirmedAnswer", "답변");
+    postItem(owner, item, "/reconfirmations", body).andExpect(status().isBadRequest());
+    db.update("UPDATE care_item SET status='CONFIRMED' WHERE id=?", item);
+    body.withObject("/values/fields").putNull("confirmedAnswer");
+    postItem(owner, item, "/reconfirmations", body).andExpect(status().isBadRequest());
+    body.withObject("/values/fields").put("confirmedAnswer", "새로 확인한 답변");
+    postItem(owner, item, "/reconfirmations", body).andExpect(status().isOk());
+    var detail = data(owner, item, "");
+    assertThat(detail.path("status").asText()).isEqualTo("CONFIRMED");
+    assertThat(detail.path("confirmedAnswer").asText()).isEqualTo("새로 확인한 답변");
+
+    String savedProof = data(owner, item, "/history/2").at("/evidenceIds/0").asText();
+    db.update("UPDATE care_item SET needs_reconfirmation=TRUE WHERE id=?", item);
+    var retry =
+        reconfirmationBody("2", acquireReconfirmation(item, "2"), "다시 확인한 질문").putNull("basis");
+    retry.putArray("evidenceIds").add(savedProof);
+    retry.withObject("/values/fields").put("confirmedAnswer", "다른 답변");
+    postItem(owner, item, "/reconfirmations", retry).andExpect(status().isBadRequest());
+    retry.withObject("/values/fields").put("confirmedAnswer", "새로 확인한 답변");
+    postItem(owner, item, "/reconfirmations", retry).andExpect(status().isOk());
+  }
+
+  private ObjectNode reconfirmationBody(String version, String token, String title) {
+    var body =
+        mapper
+            .createObjectNode()
+            .put("expectedItemVersion", version)
+            .put("leaseToken", token)
+            .put("clientRequestId", UUID.randomUUID().toString())
+            .put("basis", "직접 통화해 확인함");
+    body.putArray("evidenceIds");
+    body.putObject("values").put("title", title).putObject("fields");
+    return body;
+  }
+
+  private String acquireReconfirmation(UUID item, String version) throws Exception {
+    return responseData(
+            postItem(
+                    owner,
+                    item,
+                    "/edit-lock",
+                    mapper
+                        .createObjectNode()
+                        .put("expectedItemVersion", version)
+                        .put("purpose", "RECONFIRMATION"))
+                .andExpect(status().isCreated()))
+        .path("leaseToken")
+        .asText();
+  }
+
+  private ResultActions postItem(UUID actor, UUID item, String suffix, JsonNode body)
+      throws Exception {
+    return mvc.perform(
+        post(path(item, suffix))
+            .with(authentication(login(actor)))
+            .with(csrf())
+            .contentType("application/json")
+            .content(body.toString()));
+  }
+
+  private JsonNode responseData(ResultActions action) throws Exception {
+    return mapper.readTree(action.andReturn().getResponse().getContentAsByteArray()).path("data");
+  }
+
+  @Test
+  void deletionErasesTransitiveCopiesAndRollsBackWhenRecordingTheResultFails() throws Exception {
+    var first = propose("CREATE", null);
+    UUID item = apply(first, null);
+    var second = propose("LINK_EVIDENCE", item);
+    apply(second, item);
+    UUID itemDocument = document(item);
+    locks.acquire(member, space, item, 2);
+    var body = deletionBody(deletionImpact(first.recordId()));
+    CommandReceiptRepository target = AopTestUtils.getUltimateTargetObject(receipts);
+    doThrow(new DataAccessResourceFailureException("test receipt failure"))
+        .doCallRealMethod()
+        .when(target)
+        .saveSuccess(any(), any(), any(), any());
+
+    executeDeletion(first.recordId(), body).andExpect(status().isInternalServerError());
+    assertThat(
+            db.queryForObject(
+                "SELECT lifecycle FROM source_record WHERE id=?", String.class, first.recordId()))
+        .isEqualTo("ACTIVE");
+    assertThat(
+            db.queryForObject(
+                "SELECT body::text FROM content_document WHERE id=?", String.class, itemDocument))
+        .contains("확정 항목");
+    assertThat(
+            db.queryForObject(
+                "SELECT count(*) FROM care_item_edit_lock WHERE item_id=?", Integer.class, item))
+        .isOne();
+
+    executeDeletion(first.recordId(), body)
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.data.affectedItemIds[0]").value(item.toString()))
+        .andExpect(jsonPath("$.data.reconfirmationItemIds[0]").value(item.toString()));
+    assertThat(
+            db.queryForObject(
+                "SELECT body::text FROM content_document WHERE id=?", String.class, itemDocument))
+        .isNull();
+    assertThat(
+            db.queryForObject(
+                "SELECT count(*) FROM evidence WHERE record_id IN (?,?) AND quote IS NOT NULL",
+                Integer.class,
+                first.recordId(),
+                second.recordId()))
+        .isZero();
+    assertThat(
+            db.queryForObject(
+                "SELECT lifecycle FROM source_record WHERE id=?", String.class, second.recordId()))
+        .isEqualTo("ACTIVE");
+    assertThat(
+            db.queryForObject(
+                "SELECT count(*) FROM analysis_run WHERE id IN (?,?) AND status='DISCARDED'",
+                Integer.class,
+                first.analysis().analysisId(),
+                second.analysis().analysisId()))
+        .isEqualTo(2);
+    assertThat(
+            db.queryForObject(
+                "SELECT count(*) FROM care_item_edit_lock WHERE item_id=?", Integer.class, item))
+        .isZero();
+    assertThat(data(member, item, "").path("version").asText()).isEqualTo("3");
+    assertThat(data(member, item, "/history/1").path("after").isNull()).isTrue();
+  }
+
+  @Test
+  void deletionPreservesIndependentContentAndRejectsStaleImpact() throws Exception {
+    UUID item = schedule("직접 확인한 일정");
+    var source = propose("LINK_EVIDENCE", item);
+    var stale = deletionBody(deletionImpact(source.recordId()));
+    apply(source, item);
+    executeDeletion(source.recordId(), stale)
+        .andExpect(status().isConflict())
+        .andExpect(jsonPath("$.code").value("DELETION_IMPACT_CHANGED"));
+
+    executeDeletion(source.recordId(), deletionBody(deletionImpact(source.recordId())))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.data.affectedItemIds[0]").value(item.toString()))
+        .andExpect(jsonPath("$.data.reconfirmationItemIds").isEmpty());
+    var current = data(member, item, "");
+    assertThat(current.path("title").asText()).isEqualTo("직접 확인한 일정");
+    assertThat(current.path("version").asText()).isEqualTo("3");
+    assertThat(data(member, item, "/history/2").path("evidenceIds").isEmpty()).isTrue();
+  }
+
+  @Test
+  void deletionRejectsAnalysisResultsFromTheOldWorkerLease() throws Exception {
+    var source =
+        records.create(owner, space, new CreateSourceRecordRequest("삭제할 분석 원문", UUID.randomUUID()));
+    var work =
+        execution.claim(space, source.analysis().analysisId(), Duration.ofMinutes(2)).orElseThrow();
+    var body = deletionBody(deletionImpact(source.recordId()));
+    var deleting = new CountDownLatch(1);
+    var finishDeletion = new CountDownLatch(1);
+    CommandReceiptRepository target = AopTestUtils.getUltimateTargetObject(receipts);
+    doAnswer(
+            invocation -> {
+              deleting.countDown();
+              assertThat(finishDeletion.await(10, TimeUnit.SECONDS)).isTrue();
+              return invocation.callRealMethod();
+            })
+        .when(target)
+        .saveSuccess(any(), any(), any(), any());
+    try (var pool = Executors.newFixedThreadPool(2)) {
+      var deletion = pool.submit(() -> executeDeletion(source.recordId(), body));
+      Future<Boolean> completion;
+      try {
+        assertThat(deleting.await(10, TimeUnit.SECONDS)).isTrue();
+        var completing = new CountDownLatch(1);
+        completion =
+            pool.submit(
+                () -> {
+                  completing.countDown();
+                  return execution.completeV2(
+                      work, new AiV2AnalysisResponse(work.run().requestId(), List.of()));
+                });
+        assertThat(completing.await(10, TimeUnit.SECONDS)).isTrue();
+        assertThatThrownBy(() -> completion.get(200, TimeUnit.MILLISECONDS))
+            .isInstanceOf(TimeoutException.class);
+      } finally {
+        finishDeletion.countDown();
+      }
+      deletion.get(10, TimeUnit.SECONDS).andExpect(status().isOk());
+      assertThat(completion.get(10, TimeUnit.SECONDS)).isFalse();
+    }
+    assertThat(
+            db.queryForObject(
+                "SELECT count(*) FROM ai_proposal WHERE run_id=?", Integer.class, work.run().id()))
+        .isZero();
+  }
+
+  private ObjectNode deletionBody(JsonNode impact) {
+    return mapper
+        .createObjectNode()
+        .put("expectedRecordVersion", impact.path("recordVersion").asText())
+        .put("impactToken", impact.path("impactToken").asText())
+        .put("clientRequestId", UUID.randomUUID().toString());
+  }
+
+  private ResultActions executeDeletion(UUID record, ObjectNode body) throws Exception {
+    return mvc.perform(
+        post("/api/spaces/" + space + "/source-records/" + record + "/deletions")
+            .with(authentication(login(owner)))
+            .with(csrf())
+            .contentType("application/json")
+            .content(body.toString()));
+  }
+
+  @Test
+  void deletionImpactFollowsCapturedProvenanceWithoutCountingAnItemTwice() throws Exception {
+    var first = propose("CREATE", null);
+    UUID item = apply(first, null);
+    var second = propose("LINK_EVIDENCE", item);
+    apply(second, item);
+    var itemBefore = db.queryForMap("SELECT * FROM care_item WHERE id=?", item);
+
+    var impact = deletionImpact(first.recordId());
+
+    assertThat(impact.at("/counts/proposals").asInt()).isEqualTo(2);
+    assertThat(impact.at("/counts/evidence").asInt()).isEqualTo(2);
+    assertThat(impact.at("/counts/items").asInt()).isOne();
+    assertThat(impact.at("/counts/historyEntries").asInt()).isEqualTo(2);
+    assertThat(impact.path("affectedItems").size()).isOne();
+    assertThat(impact.at("/affectedItems/0/itemId").asText()).isEqualTo(item.toString());
+    assertThat(impact.at("/affectedItems/0/itemVersion").asText()).isEqualTo("2");
+    assertThat(impact.at("/affectedItems/0/hasIndependentEvidence").asBoolean()).isFalse();
+    assertThat(impact.at("/affectedItems/0/requiresReconfirmation").booleanValue()).isTrue();
+    assertThat(impact.toString()).doesNotContain("합성 소식 근거", "AI 일정", "확정 항목");
+    assertThat(deletionImpact(first.recordId())).isEqualTo(impact);
+    assertThat(db.queryForMap("SELECT * FROM care_item WHERE id=?", item)).isEqualTo(itemBefore);
+
+    addIndependentBasis(item);
+    var withBasis = deletionImpact(first.recordId());
+    assertThat(withBasis.at("/affectedItems/0/hasIndependentEvidence").booleanValue()).isTrue();
+    assertThat(withBasis.at("/affectedItems/0/requiresReconfirmation").booleanValue()).isTrue();
+  }
+
+  @Test
+  void evidenceOnlyImpactPreservesIndependentBasisAndTracksItsIdentity() throws Exception {
+    UUID item = schedule("독립적으로 확인한 일정");
+    var source = propose("LINK_EVIDENCE", item);
+    apply(source, item);
+    var before = deletionImpact(source.recordId());
+    assertThat(before.at("/counts/historyEntries").asInt()).isOne();
+    assertThat(before.at("/affectedItems/0/hasIndependentEvidence").asBoolean()).isTrue();
+    assertThat(before.at("/affectedItems/0/requiresReconfirmation").booleanValue()).isFalse();
+
+    addIndependentBasis(item);
+    var after = deletionImpact(source.recordId());
+    assertThat(after.path("counts")).isEqualTo(before.path("counts"));
+    assertThat(after.path("affectedItems")).isEqualTo(before.path("affectedItems"));
+    assertThat(after.path("impactToken").asText())
+        .isNotEqualTo(before.path("impactToken").asText());
+  }
+
+  private void addIndependentBasis(UUID item) {
+    UUID extra = UUID.randomUUID();
+    db.update(
+        "INSERT INTO content_document(id,space_id,kind,body,created_at) VALUES (?,?,'DIRECT_INPUT','{}',now())",
+        extra,
+        space);
+    db.update(
+        "INSERT INTO care_item_basis(id,space_id,item_id,direct_document_id,created_at) VALUES (?,?,?,?,now())",
+        UUID.randomUUID(),
+        space,
+        item,
+        extra);
+  }
+
+  @Test
+  void deletionImpactOmitsDetachedHistoryLinksAndAlreadyRemovedCopies() throws Exception {
+    UUID item = schedule("직접 확인한 일정");
+    var source = propose("LINK_EVIDENCE", item);
+    apply(source, item);
+    db.update(
+        "DELETE FROM care_item_basis WHERE item_id=? AND source_evidence_id IS NOT NULL", item);
+
+    var detached = deletionImpact(source.recordId());
+    assertThat(detached.at("/counts/proposals").asInt()).isOne();
+    assertThat(detached.at("/counts/items").asInt()).isZero();
+    assertThat(detached.at("/counts/historyEntries").asInt()).isZero();
+
+    db.update(
+        """
+        UPDATE content_document SET body=NULL,redacted_at=now()
+        WHERE id=(SELECT output_document_id FROM ai_proposal WHERE run_id=?)
+        """,
+        source.analysis().analysisId());
+    db.update(
+        "UPDATE evidence SET quote=NULL,redacted_at=now() WHERE record_id=?", source.recordId());
+    var removed = deletionImpact(source.recordId());
+    assertThat(removed.at("/counts/proposals").asInt()).isZero();
+    assertThat(removed.at("/counts/evidence").asInt()).isZero();
+    assertThat(removed.path("affectedItems").isEmpty()).isTrue();
+  }
+
+  private JsonNode deletionImpact(UUID record) throws Exception {
+    var response =
+        mvc.perform(
+                get("/api/spaces/" + space + "/source-records/" + record + "/deletion-impact")
+                    .with(authentication(login(owner))))
+            .andExpect(status().isOk())
+            .andReturn()
+            .getResponse();
+    return mapper.readTree(response.getContentAsString()).path("data");
+  }
+
+  @Test
+  void appliedAiCreateAndEvidenceLinkIdentifyOnlyTheirOwnChangeEvidence() throws Exception {
+    var first = propose("CREATE", null);
+    UUID item = apply(first, null);
+    String initial = data(member, item, "/history/1").path("evidenceIds").get(0).asText();
+    assertThat(data(member, item, "/evidence").at("/items/0/evidenceId").asText())
+        .isEqualTo(initial);
+    var second = propose("LINK_EVIDENCE", item);
+    apply(second, item);
+    var detail = data(member, item, "/history/2");
+    assertThat(detail.path("before")).isEqualTo(detail.path("after"));
+    assertThat(detail.path("evidenceIds").size()).isOne();
+    assertThat(detail.path("evidenceIds").get(0).asText()).isNotEqualTo(initial);
+    assertThat(data(member, item, "/history/1").path("evidenceIds"))
+        .extracting(JsonNode::asText)
+        .containsExactly(initial);
+    db.update(
+        "UPDATE ai_proposal SET invalidated_at=now() WHERE run_id=?",
+        second.analysis().analysisId());
+    assertThat(data(member, item, "/evidence").at("/items/1/text").isNull()).isTrue();
+    assertThat(data(member, item, "/history/2").path("evidenceIds").isEmpty()).isTrue();
+    assertThat(data(member, item, "/history/1").path("evidenceIds"))
+        .extracting(JsonNode::asText)
+        .containsExactly(initial);
+  }
+
+  @ParameterizedTest
+  @ValueSource(
+      strings = {"QUOTE", "SOURCE_VERSION", "SOURCE_ERASED", "PROPOSAL", "PROPOSAL_DOCUMENT"})
+  void historyOmitsUnavailableEvidenceWhileKeepingChangeMetadata(String invalidation)
+      throws Exception {
+    var source = propose("CREATE", null);
+    UUID item = apply(source, null);
+    var original = data(member, item, "/history/1");
+    UUID evidence = UUID.fromString(original.at("/evidenceIds/0").asText());
+    switch (invalidation) {
+      case "QUOTE" ->
+          db.update("UPDATE evidence SET quote=NULL,redacted_at=now() WHERE id=?", evidence);
+      case "SOURCE_VERSION" ->
+          db.update("UPDATE source_record SET version=version+1 WHERE id=?", source.recordId());
+      case "SOURCE_ERASED" ->
+          db.update(
+              "UPDATE source_record SET lifecycle='ERASED',body=NULL,erased_at=now() WHERE id=?",
+              source.recordId());
+      case "PROPOSAL" ->
+          db.update(
+              "UPDATE ai_proposal SET invalidated_at=now() WHERE run_id=?",
+              source.analysis().analysisId());
+      case "PROPOSAL_DOCUMENT" ->
+          db.update(
+              "UPDATE content_document SET body=NULL,redacted_at=now() WHERE id=(SELECT output_document_id FROM ai_proposal WHERE run_id=?)",
+              source.analysis().analysisId());
+      default -> throw new IllegalArgumentException(invalidation);
+    }
+    var after = data(member, item, "/history/1");
+    assertThat(after.path("evidenceIds").isEmpty()).isTrue();
+    assertThat(after.path("changedBy")).isEqualTo(original.path("changedBy"));
+    assertThat(after.path("changedAt")).isEqualTo(original.path("changedAt"));
+    assertThat(data(member, item, "/evidence").at("/items/0/status").asText())
+        .isEqualTo("REDACTED");
+  }
+
+  @Test
+  void tiedEvidenceConnectionsSortByPublicEvidenceId() throws Exception {
+    UUID item = schedule("정렬 확인");
+    var source =
+        records.create(
+            member, space, new CreateSourceRecordRequest("첫 번째 근거와 두 번째 근거", UUID.randomUUID()));
+    List<UUID> evidenceIds =
+        List.of(
+            UUID.fromString("00000000-0000-4000-8000-000000000001"),
+            UUID.fromString("00000000-0000-4000-8000-000000000002"));
+    for (int i = 0; i < 2; i++) {
+      db.update(
+          "INSERT INTO evidence(id,space_id,record_id,record_version,quote,created_at) VALUES (?,?,?,1,'근거',now())",
+          evidenceIds.get(i),
+          space,
+          source.recordId());
+      db.update(
+          "INSERT INTO care_item_basis(id,space_id,item_id,source_evidence_id,created_at) VALUES (?,?,?,?,?::timestamptz)",
+          UUID.fromString("00000000-0000-4000-8000-00000000000" + (9 - i)),
+          space,
+          item,
+          evidenceIds.get(i),
+          "2099-01-01T00:00:00Z");
+    }
+    var rows = data(member, item, "/evidence").path("items");
+    assertThat(rows.size()).isEqualTo(3);
+    assertThat(rows.get(1).path("evidenceId").asText()).isEqualTo(evidenceIds.get(0).toString());
+    assertThat(rows.get(2).path("evidenceId").asText()).isEqualTo(evidenceIds.get(1).toString());
+  }
+
+  @Test
+  void databaseRejectsMultipleProposalsSharingOnePrimaryEvidence() {
+    var source = propose("CREATE", null);
+    UUID extraDocument = UUID.randomUUID();
+    db.update(
+        "INSERT INTO content_document(id,space_id,kind,body,created_at) VALUES (?,?,'AI_OUTPUT','{}',now())",
+        extraDocument,
+        space);
+    assertThatThrownBy(
+            () ->
+                db.update(
+                    """
+        INSERT INTO ai_proposal(id,space_id,run_id,ordinal_no,ai_operation,item_type,output_document_id,primary_evidence_id,resolution,created_at)
+        SELECT gen_random_uuid(),space_id,run_id,ordinal_no+1000,ai_operation,item_type,?,primary_evidence_id,resolution,now()
+        FROM ai_proposal WHERE run_id=?
+        """,
+                    extraDocument,
+                    source.analysis().analysisId()))
+        .isInstanceOf(org.springframework.dao.DuplicateKeyException.class)
+        .hasMessageContaining("ai_proposal_primary_evidence_id_key");
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"/evidence", "/history", "/history/1"})
+  void everyReadUsesOnePermissionAndDataSnapshotDuringConcurrentDepartureAndRedaction(String suffix)
+      throws Exception {
+    UUID item = schedule("스냅샷 값");
+    doAnswer(
+            invocation -> {
+              var result = invocation.callRealMethod();
+              try (var pool = Executors.newSingleThreadExecutor()) {
+                pool.submit(
+                        () -> {
+                          db.update(
+                              "UPDATE space_membership SET ended_at=now(),end_reason='LEFT' WHERE id=?",
+                              membership);
+                          db.update(
+                              "UPDATE content_document SET body=NULL,redacted_at=now() WHERE id=?",
+                              document(item));
+                        })
+                    .get(5, TimeUnit.SECONDS);
+              }
+              return result;
+            })
+        .when(repository)
+        .itemType(space, item);
+    var snapshot = data(member, item, suffix);
+    if (suffix.equals("/evidence"))
+      assertThat(snapshot.at("/items/0/text").asText()).contains("스냅샷 값");
+    else if (suffix.equals("/history"))
+      assertThat(snapshot.at("/items/0/redactedFields").isEmpty()).isTrue();
+    else assertThat(snapshot.at("/after/title").asText()).isEqualTo("스냅샷 값");
+    reset(repository);
+    mvc.perform(get(path(item, "/history/1")).with(authentication(login(member))))
+        .andExpect(status().isForbidden());
+    assertThat(data(owner, item, "/history/1").path("after").isNull()).isTrue();
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"SCHEDULE", "TASK", "QUESTION", "OBSERVATION", "GUIDANCE"})
+  void comparesAllFiveConfirmedTypesWithoutReturningInternalFields(String type) throws Exception {
+    UUID item = apply(propose("CREATE", null, type), null);
+    var detail = data(member, item, "/history/1");
+    assertThat(detail.at("/after/title").asText()).isEqualTo("확정 항목");
+    assertThat(detail.path("before").isNull()).isTrue();
+    assertThat(detail.path("evidenceIds").size()).isOne();
+    db.update(
+        "UPDATE content_document SET body=body || '{\"internalOnly\":\"private metadata\"}'::jsonb WHERE id=?",
+        document(item));
+    assertThat(data(member, item, "/history/1").toString())
+        .doesNotContain("internalOnly", "private metadata");
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"AI_PROPOSAL", "DIRECT_INPUT"})
+  void pendingRequestsStayOutsideHistoryAndApprovalPreservesOriginalInputAndDecisionAuthor(
+      String sourceType) throws Exception {
+    UUID existing = schedule("이미 확정된 항목");
+    var input = mapper.createObjectNode().put("clientRequestId", UUID.randomUUID().toString());
+    var entry =
+        input
+            .putArray("entries")
+            .addObject()
+            .put("sourceType", sourceType)
+            .put("action", "CREATE_ITEM");
+    if (sourceType.equals("AI_PROPOSAL")) {
+      var source = propose("CREATE", null);
+      UUID proposal =
+          db.queryForObject(
+              "SELECT id FROM ai_proposal WHERE run_id=?",
+              UUID.class,
+              source.analysis().analysisId());
+      entry
+          .put("proposalId", proposal.toString())
+          .put("reviewToken", proposals.detail(member, space, proposal).reviewToken());
+    }
+    entry.set(
+        "values",
+        mapper.readTree(
+            "{\"itemType\":\"SCHEDULE\",\"title\":\"구성원 입력\",\"description\":null,\"fields\":{}}"));
+    var submitted = requests.submit(member, space, input);
+    assertThat(data(member, existing, "/history").path("items").size()).isOne();
+    assertThat(
+            db.queryForObject("SELECT count(*) FROM care_item WHERE space_id=?", Long.class, space))
+        .isOne();
+    UUID request = UUID.fromString(submitted.path("requestId").asText());
+    var requested = requestQueries.detail(owner, space, request).at("/entries/0");
+    var decision = mapper.createObjectNode().put("clientRequestId", UUID.randomUUID().toString());
+    decision
+        .putArray("entries")
+        .addObject()
+        .put("requestEntryId", requested.path("requestEntryId").asText())
+        .put("reviewToken", requested.path("reviewToken").asText());
+    var applied = requests.apply(owner, space, decision);
+    UUID item = UUID.fromString(applied.at("/results/0/itemId").asText());
+    var detail = data(member, item, "/history/1");
+    assertThat(detail.at("/after/title").asText()).isEqualTo("구성원 입력");
+    assertThat(detail.at("/changedBy/membershipId").asText()).isEqualTo(ownerMembership.toString());
+    assertThat(detail.path("evidenceIds").size()).isOne();
+    var evidence = data(member, item, "/evidence").at("/items/0");
+    assertThat(detail.path("evidenceIds").get(0)).isEqualTo(evidence.path("evidenceId"));
+    if (sourceType.equals("DIRECT_INPUT")) {
+      assertThat(evidence.path("createdByMembershipId").asText()).isEqualTo(membership.toString());
+      assertThat(evidence.path("text").asText()).contains("구성원 입력");
+    } else {
+      db.update(
+          "UPDATE evidence SET quote=NULL,redacted_at=now() WHERE id=?",
+          UUID.fromString(evidence.path("evidenceId").asText()));
+      assertThat(data(member, item, "/history/1").path("evidenceIds").isEmpty()).isTrue();
+    }
+  }
+
+  @Test
+  void exposesTypedOpenApiResponsesWithSessionOnlyReadSecurity() throws Exception {
+    var spec =
+        mapper.readTree(
+            mvc.perform(get("/v3/api-docs"))
+                .andExpect(status().isOk())
+                .andReturn()
+                .getResponse()
+                .getContentAsByteArray());
+    String base = "/api/spaces/{spaceId}/items/{itemId}";
+    for (String suffix : List.of("/evidence", "/history", "/history/{version}")) {
+      var operation = spec.path("paths").path(base + suffix).path("get");
+      assertThat(
+              operation
+                  .path("responses")
+                  .path("200")
+                  .at("/content/application~1json/schema/$ref")
+                  .asText())
+          .startsWith("#/components/schemas/");
+      assertThat(operation.path("security").toString())
+          .contains("SessionCookie")
+          .doesNotContain("CsrfToken");
+      assertThat(operation.path("parameters"))
+          .noneSatisfy(parameter -> assertThat(parameter.path("name").asText()).isEqualTo("actor"));
+      for (String code : List.of("400", "401", "403", "404", "500"))
+        assertThat(operation.path("responses").has(code)).isTrue();
+    }
+  }
+
+  @Test
+  void assigneeOnlyEditHasDedicatedHistoryKind() throws Exception {
+    UUID item =
+        create
+            .create(
+                owner,
+                space,
+                new CreateCareItemRequest(
+                    "TASK",
+                    "할 일",
+                    null,
+                    new CreateCareItemRequest.TaskFields(null, membership.toString()),
+                    UUID.randomUUID()))
+            .itemId();
+    var edit = command(owner, item, 1);
+    edit.putObject("values").putObject("fields").putNull("assigneeMembershipId");
+    update.update(owner, space, item, edit, false);
+    assertThat(data(member, item, "/history").at("/items/0/changeKind").asText())
+        .isEqualTo("ASSIGNEE_CHANGE");
+  }
+
+  private CreateSourceRecordResponse propose(String operation, UUID target) {
+    return propose(operation, target, "SCHEDULE");
+  }
+
+  private CreateSourceRecordResponse propose(String operation, UUID target, String type) {
+    var source =
+        records.create(owner, space, new CreateSourceRecordRequest("합성 소식 근거", UUID.randomUUID()));
+    var work =
+        execution.claim(space, source.analysis().analysisId(), Duration.ofMinutes(2)).orElseThrow();
+    var candidate =
+        target == null
+            ? null
+            : work.v2Request().candidates().stream()
+                .filter(c -> c.itemId().equals(target))
+                .findFirst()
+                .orElseThrow();
+    var suggestion =
+        new Suggestion(
+            Operation.valueOf(operation),
+            CareItemType.valueOf(type),
+            target,
+            candidate == null ? null : candidate.version(),
+            List.of(),
+            "AI 일정",
+            "합성 소식 근거",
+            operation.equals("CREATE") ? Map.of("title", "AI 일정") : Map.of(),
+            List.of(),
+            operation.equals("CREATE") ? RelationKind.NEW : RelationKind.DUPLICATE,
+            List.of(),
+            candidate == null
+                ? List.of()
+                : List.of(
+                    new BasisReference(target, List.of(candidate.basis().getFirst().basisId()))));
+    assertThat(
+            execution.completeV2(
+                work, new AiV2AnalysisResponse(work.v2Request().requestId(), List.of(suggestion))))
+        .isTrue();
+    return source;
+  }
+
+  private UUID apply(CreateSourceRecordResponse source, UUID target) {
+    UUID proposal =
+        db.queryForObject(
+            "SELECT id FROM ai_proposal WHERE run_id=?",
+            UUID.class,
+            source.analysis().analysisId());
+    var body = mapper.createObjectNode().put("clientRequestId", UUID.randomUUID().toString());
+    var entry =
+        body.putArray("entries")
+            .addObject()
+            .put("proposalId", proposal.toString())
+            .put("action", target == null ? "CREATE_ITEM" : "LINK_EVIDENCE")
+            .put("reviewToken", proposals.detail(owner, space, proposal).reviewToken());
+    if (target == null) {
+      String type =
+          db.queryForObject("SELECT item_type FROM ai_proposal WHERE id=?", String.class, proposal);
+      var values =
+          mapper
+              .createObjectNode()
+              .put("itemType", type)
+              .put("title", "확정 항목")
+              .putNull("description");
+      values.putObject("fields");
+      entry.set("values", values);
+    } else
+      entry
+          .put("targetItemId", target.toString())
+          .put("expectedItemVersion", "1")
+          .put("leaseToken", locks.acquire(owner, space, target, 1).leaseToken());
+    return decisions.apply(owner, space, body).results().getFirst().itemId();
+  }
+
+  private UUID schedule(String title) {
+    return create
+        .create(
+            owner,
+            space,
+            new CreateCareItemRequest(
+                "SCHEDULE", title, null, new ScheduleFields(null, null, null), UUID.randomUUID()))
+        .itemId();
+  }
+
+  private UUID document(UUID item) {
+    return db.queryForObject(
+        "SELECT current_document_id FROM care_item WHERE id=?", UUID.class, item);
+  }
+
+  private ObjectNode command(UUID actor, UUID item, long version) {
+    return mapper
+        .createObjectNode()
+        .put("clientRequestId", UUID.randomUUID().toString())
+        .put("expectedItemVersion", Long.toString(version))
+        .put("leaseToken", locks.acquire(actor, space, item, version).leaseToken());
+  }
+
+  private String path(UUID item, String suffix) {
+    return "/api/spaces/" + space + "/items/" + item + suffix;
+  }
+
+  private JsonNode data(UUID actor, UUID item, String suffix) throws Exception {
+    var response =
+        mvc.perform(get(path(item, suffix)).with(authentication(login(actor))))
+            .andExpect(status().isOk())
+            .andExpect(header().string("Cache-Control", "no-store"))
+            .andReturn()
+            .getResponse();
+    return mapper.readTree(response.getContentAsByteArray()).path("data");
+  }
+
+  private UUID user(String name) {
+    UUID id = UUID.randomUUID();
+    db.update(
+        "INSERT INTO app_user(id,display_name,created_at,updated_at) VALUES (?,?,now(),now())",
+        id,
+        name);
+    db.update(
+        "INSERT INTO social_account(id,user_id,provider,provider_user_id,created_at) VALUES (?,?,'KAKAO',?,now())",
+        UUID.randomUUID(),
+        id,
+        id.toString());
+    return id;
+  }
+
+  private OAuth2AuthenticationToken login(UUID user) {
+    var roles = List.of(new SimpleGrantedAuthority("ROLE_USER"));
+    return new OAuth2AuthenticationToken(
+        new MemberOAuth2User(
+            user, new DefaultOAuth2User(roles, Map.of("id", user.toString()), "id")),
+        roles,
+        "kakao");
+  }
+}

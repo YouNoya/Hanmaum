@@ -1,0 +1,69 @@
+import { ApiError, normalizeApiError } from "./apiError";
+import type { CsrfToken } from "./apiTypes";
+import { isCsrfToken } from "./apiValidators";
+import { getApiUrl, httpClient } from "./httpClient";
+
+let cachedToken: CsrfToken | undefined;
+let generation = 0;
+let pending:
+  { controller: AbortController; promise: Promise<CsrfToken> } | undefined;
+
+// OAuth 준비는 오래된 메모리 토큰 대신 실제 세션 쿠키 발급 응답을 기다린다.
+// 일반 변경 요청은 동시 발급·캐시를 관리하는 getCsrfToken을 사용한다.
+export async function requestCsrfToken(
+  signal: AbortSignal,
+): Promise<CsrfToken> {
+  try {
+    const response = await httpClient.get<unknown>(
+      getApiUrl("/api/auth/csrf"),
+      {
+        signal,
+      },
+    );
+    const value = response.data;
+    if (response.status !== 200 || !isCsrfToken(value)) {
+      throw new ApiError({
+        kind: "invalid-response",
+        status: response.status,
+        message: "CSRF 응답 형식을 확인할 수 없습니다.",
+      });
+    }
+
+    return { headerName: value.headerName, token: value.token };
+  } catch (error) {
+    throw normalizeApiError(error);
+  }
+}
+
+export async function getCsrfToken(): Promise<CsrfToken> {
+  const currentGeneration = generation;
+  if (!cachedToken && !pending) {
+    const controller = new AbortController();
+    const promise = requestCsrfToken(controller.signal)
+      .then((token) => {
+        if (generation === currentGeneration) cachedToken = token;
+        return token;
+      })
+      .finally(() => {
+        if (pending?.promise === promise) pending = undefined;
+      });
+    pending = { controller, promise };
+  }
+
+  const token = cachedToken ?? (await pending!.promise);
+  if (generation !== currentGeneration) {
+    throw new ApiError({
+      kind: "cancelled",
+      message: "세션이 변경되어 CSRF 요청이 취소되었습니다.",
+    });
+  }
+  return token;
+}
+
+// Call after login/logout; the next write obtains a fresh session-bound token.
+export function resetCsrfToken(): void {
+  generation += 1;
+  cachedToken = undefined;
+  pending?.controller.abort();
+  pending = undefined;
+}

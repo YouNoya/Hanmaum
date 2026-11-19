@@ -1,0 +1,143 @@
+import {
+  careStatusTabs,
+  type CareListFilter,
+} from "@/features/careitem/model/careItemSelectors";
+
+export const paths = {
+  landing: "/",
+  login: "/login",
+  authCallback: "/auth/callback",
+  account: "/account",
+  logout: "/account/logout",
+  withdrawal: "/account/withdraw",
+  withdrawalNews: "/account/withdraw/news",
+  withdrawalComplete: "/account/withdraw/complete",
+  onboardingGuide: "/onboarding/guide",
+  spaces: "/spaces",
+  spaceCreate: "/spaces/new",
+  components: "/_dev/components",
+} as const;
+
+export function accountPath(spaceId?: string) {
+  return `${paths.account}${spaceId ? `?space=${encodeURIComponent(spaceId)}` : ""}`;
+}
+export function spaceInfoPath(spaceId: string) {
+  return `${paths.spaces}/${encodeURIComponent(spaceId)}/info`;
+}
+export function spaceInfoRequestsPath(spaceId: string) {
+  return `${spaceInfoPath(spaceId)}/requests`;
+}
+export function spaceInfoRequestPath(spaceId: string, requestId: string) {
+  return `${spaceInfoRequestsPath(spaceId)}/${encodeURIComponent(requestId)}`;
+}
+
+export const spaceTabs = ["home", "care", "news", "family", "all"] as const;
+export type SpaceTab = (typeof spaceTabs)[number];
+
+export function spacePath(careSpaceId: string, tab: SpaceTab = "home") {
+  return `${paths.spaces}/${encodeURIComponent(careSpaceId)}/${tab}`;
+}
+
+export function spaceInvitePath(careSpaceId: string) {
+  return `${paths.spaces}/${encodeURIComponent(careSpaceId)}/invite`;
+}
+
+export function newsCreatePath(careSpaceId: string) {
+  return `${spacePath(careSpaceId, "news")}/new`;
+}
+
+export function familyMembersPath(spaceId: string) {
+  return `${spacePath(spaceId, "family")}/members`;
+}
+export function familyRemovePath(spaceId: string, memberId: string) {
+  return `${familyMembersPath(spaceId)}/${encodeURIComponent(memberId)}/remove`;
+}
+export function familyTransferPath(spaceId: string, memberId?: string) {
+  return `${spacePath(spaceId, "family")}/transfer${memberId ? `/${encodeURIComponent(memberId)}` : ""}`;
+}
+export function familyLeavePath(spaceId: string) {
+  return `${spacePath(spaceId, "family")}/leave`;
+}
+export function familyDeletePath(spaceId: string) {
+  return `${spacePath(spaceId, "family")}/delete`;
+}
+
+export function newsDetailPath(careSpaceId: string, recordId: string) {
+  return `${spacePath(careSpaceId, "news")}/${encodeURIComponent(recordId)}`;
+}
+export function newsDeletePath(careSpaceId: string, recordId: string) {
+  return `${newsDetailPath(careSpaceId, recordId)}/delete`;
+}
+export function newsDeletionPath(careSpaceId: string, deletionId: string) {
+  return `${spacePath(careSpaceId, "news")}/deletions/${encodeURIComponent(deletionId)}`;
+}
+
+export function proposalListPath(
+  careSpaceId: string,
+  status = "review",
+  fromTab?: SpaceTab,
+) {
+  const params = new URLSearchParams({ status });
+  if (fromTab) params.set("fromTab", fromTab);
+  return `${paths.spaces}/${encodeURIComponent(careSpaceId)}/proposals?${params}`;
+}
+export function proposalReviewPath(careSpaceId: string, recordId: string) {
+  return `${newsDetailPath(careSpaceId, recordId)}/proposals`;
+}
+export function proposalConfirmPath(careSpaceId: string) {
+  return `${paths.spaces}/${encodeURIComponent(careSpaceId)}/proposals/confirm`;
+}
+export function proposalRequestPath(careSpaceId: string, requestId: string) {
+  return `${paths.spaces}/${encodeURIComponent(careSpaceId)}/proposal-requests/${encodeURIComponent(requestId)}`;
+}
+export function proposalResultPath(
+  careSpaceId: string,
+  resultId: string,
+  fromTab?: SpaceTab,
+) {
+  const path = `${paths.spaces}/${encodeURIComponent(careSpaceId)}/proposals/results/${encodeURIComponent(resultId)}`;
+  return fromTab ? `${path}?${new URLSearchParams({ fromTab })}` : path;
+}
+export function proposalEditPath(careSpaceId: string, proposalId: string) {
+  return `${paths.spaces}/${encodeURIComponent(careSpaceId)}/proposals/${encodeURIComponent(proposalId)}/edit`;
+}
+export function proposalTargetPath(careSpaceId: string, proposalId: string) {
+  return `${paths.spaces}/${encodeURIComponent(careSpaceId)}/proposals/${encodeURIComponent(proposalId)}/target`;
+}
+export function proposalEvidencePath(careSpaceId: string, proposalId: string) {
+  return `${paths.spaces}/${encodeURIComponent(careSpaceId)}/proposals/${encodeURIComponent(proposalId)}/evidence`;
+}
+export function careItemPath(careSpaceId: string, itemId: string) {
+  return `${spacePath(careSpaceId, "care")}/items/${encodeURIComponent(itemId)}`;
+}
+export function careListPath(
+  careSpaceId: string,
+  filter: CareListFilter = { type: "schedule" },
+) {
+  const params = new URLSearchParams({ type: filter.type });
+  if (
+    filter.status &&
+    careStatusTabs[filter.type].some((tab) => tab.value === filter.status)
+  )
+    params.set("status", filter.status);
+  return `${spacePath(careSpaceId, "care")}?${params}`;
+}
+export function careSourcesPath(careSpaceId: string, itemId: string) {
+  return `${careItemPath(careSpaceId, itemId)}/sources`;
+}
+export function careReconfirmPath(careSpaceId: string, itemId: string) {
+  return `${careItemPath(careSpaceId, itemId)}/reconfirm`;
+}
+export function careCreatePath(spaceId: string, kind: string) {
+  return `${spacePath(spaceId, "care")}/new/${encodeURIComponent(kind)}`;
+}
+export function careSharePath(spaceId: string, itemId: string) {
+  return `${careItemPath(spaceId, itemId)}/share`;
+}
+export function careHistoryPath(
+  careSpaceId: string,
+  itemId: string,
+  historyId?: string,
+) {
+  return `${careItemPath(careSpaceId, itemId)}/history${historyId ? `/${encodeURIComponent(historyId)}` : ""}`;
+}

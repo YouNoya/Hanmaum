@@ -1,0 +1,138 @@
+import { Avatar, Badge, Button, type BadgeProps } from "@/components/ui";
+export type NewsStatus =
+  | "recorded"
+  | "analysis-completed"
+  | "analysis-discarded"
+  | "analyzing"
+  | "review"
+  | "pending"
+  | "applied"
+  | "rejected"
+  | "no-change"
+  | "failed";
+const statuses: Record<
+  NewsStatus,
+  { label: string; tone: BadgeProps["tone"]; message: string }
+> = {
+  recorded: {
+    label: "소식 저장",
+    tone: "neutral",
+    message: "가족이 남긴 소식이에요.",
+  },
+  "analysis-completed": {
+    label: "분석 완료",
+    tone: "neutral",
+    message: "소식 분석이 완료됐어요. 제안의 반영 여부는 별도로 확인해 주세요.",
+  },
+  "analysis-discarded": {
+    label: "분석 종료",
+    tone: "neutral",
+    message: "이 소식의 분석이 종료됐어요.",
+  },
+  analyzing: {
+    label: "분석 중",
+    tone: "neutral",
+    message: "소식은 저장됐어요. 분석 결과를 준비하고 있어요.",
+  },
+  review: {
+    label: "검토 대기",
+    tone: "brand",
+    message: "변경 제안을 확인해 주세요.",
+  },
+  pending: {
+    label: "승인 대기",
+    tone: "neutral",
+    message: "소유자가 요청을 확인하고 있어요.",
+  },
+  applied: {
+    label: "반영",
+    tone: "brand",
+    message: "검토한 제안이 반영됐어요.",
+  },
+  rejected: {
+    label: "미적용",
+    tone: "neutral",
+    message: "제안을 미적용 처리했어요. 현재 돌봄 정보는 유지돼요.",
+  },
+  "no-change": {
+    label: "제안 없음",
+    tone: "neutral",
+    message: "현재 정보에 반영할 제안이 없어요.",
+  },
+  failed: {
+    label: "분석 실패",
+    tone: "error",
+    message: "소식은 저장됐어요. 분석을 다시 시도할 수 있어요.",
+  },
+};
+export type NewsCardProps = {
+  title?: string;
+  author: string;
+  authorImageUrl?: string | null;
+  body: string;
+  previewBody?: boolean;
+  status: NewsStatus;
+  statusMessage?: string;
+  onAction?: () => void;
+  actionLabel?: string;
+  actionLoading?: boolean;
+  className?: string;
+};
+export function NewsCard({
+  title,
+  author,
+  authorImageUrl,
+  body,
+  previewBody = false,
+  status,
+  statusMessage,
+  onAction,
+  actionLabel,
+  actionLoading = false,
+  className = "",
+}: NewsCardProps) {
+  const presentation = statuses[status];
+  return (
+    <article
+      className={`flex w-full min-w-0 flex-col items-start gap-hm-12 rounded-hm-14 bg-hm-bg-surface p-hm-20 wrap-anywhere ${className}`}
+    >
+      <div className="flex w-full items-center gap-hm-8">
+        <Avatar
+          name={author}
+          profileImageUrl={authorImageUrl}
+          size="compact"
+          decorative
+        />
+        <p className="min-w-0 text-hm-caption-default text-hm-text-secondary">
+          {author}
+        </p>
+      </div>
+      {title && <h3 className="w-full text-hm-heading-section">{title}</h3>}
+      <p
+        className={`w-full text-hm-body-reading whitespace-pre-wrap ${previewBody ? "line-clamp-3" : ""}`}
+      >
+        {body}
+      </p>
+      <Badge
+        label={presentation.label}
+        tone={presentation.tone}
+      />
+      <p
+        className={`w-full text-hm-body-small ${status === "failed" ? "text-hm-feedback-error-text" : "text-hm-text-secondary"}`}
+      >
+        {statusMessage ?? presentation.message}
+      </p>
+      {onAction && (
+        <Button
+          variant="secondary"
+          className="w-full"
+          onClick={onAction}
+          loading={actionLoading}
+        >
+          {actionLabel ??
+            (status === "failed" ? "분석 다시 시도" : "소식 자세히 보기")}
+        </Button>
+      )}
+    </article>
+  );
+}

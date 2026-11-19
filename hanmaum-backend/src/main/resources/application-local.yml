@@ -1,0 +1,40 @@
+spring:
+  config:
+    import: optional:file:.env[.properties]
+  datasource:
+    url: jdbc:postgresql://localhost:${POSTGRES_PORT:5432}/${POSTGRES_DB:hanmaum}
+    username: ${POSTGRES_USER:hanmaum}
+    password: ${POSTGRES_PASSWORD:hanmaum-local-only}
+
+server:
+  servlet:
+    session:
+      cookie:
+        secure: false
+
+springdoc:
+  api-docs:
+    enabled: true
+  swagger-ui:
+    enabled: true
+
+app:
+  sharing:
+    url-prefix: ${SHARE_URL_PREFIX:${FRONTEND_URL:http://localhost:5173}/share/}
+  ai:
+    v2:
+      # Agreed initial local/integration profile; does not switch analysis execution to v2.
+      max-request-bytes: ${AI_V2_MAX_REQUEST_BYTES:1048576}
+      max-response-bytes: ${AI_V2_MAX_RESPONSE_BYTES:524288}
+  invitations:
+    # Public local-only key. Never use this value outside local development.
+    encryption-key: ${INVITATION_ENCRYPTION_KEY:bG9jYWwtaW52aXRhdGlvbi1rZXktMzItYnl0ZXMhISE=}
+    url-prefix: ${INVITATION_URL_PREFIX:http://localhost:5173/invitations/}
+  commands:
+    digest-key: ${COMMAND_DIGEST_KEY:local-development-only-command-digest-key}
+  security:
+    allowed-origins:
+      - http://localhost:5173
+      - http://127.0.0.1:5173
+    login-success-url: ${FRONTEND_URL:http://localhost:5173}
+    public-docs: true

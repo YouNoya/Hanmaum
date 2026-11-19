@@ -1,0 +1,32 @@
+spring:
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+
+# Only a trusted reverse proxy may reach the application port in production.
+server:
+  forward-headers-strategy: framework
+
+springdoc:
+  api-docs:
+    enabled: true
+  swagger-ui:
+    enabled: true
+
+app:
+  sharing:
+    url-prefix: ${SHARE_URL_PREFIX:${FRONTEND_URL}/share/}
+  invitations:
+    encryption-key: ${INVITATION_ENCRYPTION_KEY}
+    url-prefix: ${INVITATION_URL_PREFIX}
+  commands:
+    digest-key: ${COMMAND_DIGEST_KEY}
+  security:
+    login-success-url: ${LOGIN_SUCCESS_URL:${FRONTEND_URL}}
+    # Publish API documentation; API session authentication and CSRF still apply.
+    public-docs: true
+  ai:
+    base-url: ${AI_BASE_URL}
+    api-key: ${AI_INTERNAL_API_KEY}
+    verify-on-startup: ${AI_VERIFY_ON_STARTUP:false}

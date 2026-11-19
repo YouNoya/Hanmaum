@@ -1,0 +1,71 @@
+package com.hanmaum.backend.user.service;
+
+import com.hanmaum.backend.user.entity.AppUser;
+import com.hanmaum.backend.user.entity.SocialAccount;
+import com.hanmaum.backend.user.entity.SocialProvider;
+import com.hanmaum.backend.user.repository.AppUserRepository;
+import com.hanmaum.backend.user.repository.SocialAccountIdentityLockRepository;
+import com.hanmaum.backend.user.repository.SocialAccountRepository;
+import java.time.Instant;
+import java.util.Objects;
+import java.util.UUID;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class SocialLoginMemberService {
+  private final AppUserRepository users;
+  private final SocialAccountRepository socialAccounts;
+  private final SocialAccountIdentityLockRepository identityLocks;
+  private final MemberLifecycleAccess lifecycle;
+
+  public SocialLoginMemberService(
+      AppUserRepository users,
+      SocialAccountRepository socialAccounts,
+      SocialAccountIdentityLockRepository identityLocks,
+      MemberLifecycleAccess lifecycle) {
+    this.users = users;
+    this.socialAccounts = socialAccounts;
+    this.identityLocks = identityLocks;
+    this.lifecycle = lifecycle;
+  }
+
+  /**
+   * Resolves a verified provider identity under its registration lock, then checks member
+   * lifecycle. Removed mappings create a new account without reconnecting historical memberships.
+   */
+  @Transactional(isolation = Isolation.READ_COMMITTED)
+  public UUID findOrCreate(
+      SocialProvider provider,
+      String providerUserId,
+      String initialDisplayName,
+      String profileImageUrl,
+      Instant profileRequestStartedAt) {
+    Objects.requireNonNull(provider, "provider");
+    Objects.requireNonNull(profileRequestStartedAt, "profileRequestStartedAt");
+    if (providerUserId == null || providerUserId.isBlank()) {
+      throw new IllegalArgumentException("A provider identity is required");
+    }
+
+    // Lock before lookup so concurrent first logins cannot leave duplicate or orphan users.
+    identityLocks.lock(provider, providerUserId);
+    UUID id =
+        socialAccounts
+            .findByProviderAndProviderUserId(provider, providerUserId)
+            .map(
+                account -> {
+                  UUID userId = account.getUser().getId();
+                  lifecycle.requireExisting(userId);
+                  return userId;
+                })
+            .orElseGet(
+                () -> {
+                  AppUser user = users.saveAndFlush(new AppUser(initialDisplayName));
+                  socialAccounts.saveAndFlush(new SocialAccount(user, provider, providerUserId));
+                  return user.getId();
+                });
+    users.updateProfileImageIfNewer(id, profileImageUrl, profileRequestStartedAt);
+    return id;
+  }
+}

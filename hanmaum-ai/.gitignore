@@ -1,0 +1,33 @@
+# Python environments and generated files
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+test-results/
+dist/
+build/
+*.egg-info/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+runtime.env
+*.pem
+*.key
+*.log
+# Local AI receipt stores and SQLite sidecar files
+*.sqlite3
+*.sqlite3-*
+
+# Editor-local state
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/tasks.json
+.DS_Store
+Thumbs.db
