@@ -1,6 +1,7 @@
 package com.hanmaum.backend;
 
 import static org.assertj.core.api.Assertions.*;
+import static org.mockito.Mockito.*;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.*;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
@@ -21,6 +22,7 @@ import com.hanmaum.backend.proposal.service.*;
 import com.hanmaum.backend.record.dto.*;
 import com.hanmaum.backend.record.service.SourceRecordCreationService;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
 import org.junit.jupiter.api.*;
@@ -32,10 +34,12 @@ import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowMapper;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.oauth2.client.authentication.OAuth2AuthenticationToken;
 import org.springframework.security.oauth2.core.user.DefaultOAuth2User;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -54,7 +58,7 @@ import tools.jackson.databind.node.ObjectNode;
 @AutoConfigureMockMvc
 @Import(TestcontainersConfiguration.class)
 class ChangeRequestIntegrationTests {
-  @Autowired JdbcTemplate jdbc;
+  @MockitoSpyBean JdbcTemplate jdbc;
   @Autowired ObjectMapper mapper;
   @Autowired MockMvc mvc;
   @Autowired CareSpaceCreationService spaces;
@@ -63,6 +67,7 @@ class ChangeRequestIntegrationTests {
   @Autowired SourceRecordCreationService records;
   @Autowired AnalysisExecutionService execution;
   @Autowired ProposalQueryService queries;
+  @Autowired ChangeRequestQueryService requestQueries;
   @Autowired ProposalDecisionService decisions;
   @Autowired EditLockService locks;
   @Autowired MembershipLifecycleService membershipChanges;
@@ -727,6 +732,11 @@ class ChangeRequestIntegrationTests {
                     new Spec("CREATE", "SCHEDULE", null, Map.of("title", "셋째"), List.of()))));
     var requests = new HashSet<String>();
     for (UUID id : ids) requests.add(submitCreate(member, id).toString());
+    jdbc.update(
+        "UPDATE change_request SET submitted_at=? WHERE space_id=?",
+        java.sql.Timestamp.from(Instant.parse("2026-10-01T00:00:00Z")),
+        space);
+    var expectedOrder = requests.stream().sorted(Comparator.reverseOrder()).toList();
     JsonNode first = getData(member, "/change-requests?size=2");
     assertThat(first.path("items").size()).isEqualTo(2);
     assertThat(first.path("hasNext").asBoolean()).isTrue();
@@ -734,6 +744,10 @@ class ChangeRequestIntegrationTests {
     JsonNode second = getData(owner, "/change-requests?size=2&cursor=" + cursor);
     assertThat(second.path("items").size()).isEqualTo(1);
     assertThat(second.path("hasNext").asBoolean()).isFalse();
+    assertThat(second.path("nextCursor").isNull()).isTrue();
+    assertThat(first.at("/items/0/requestId").asText()).isEqualTo(expectedOrder.get(0));
+    assertThat(first.at("/items/1/requestId").asText()).isEqualTo(expectedOrder.get(1));
+    assertThat(second.at("/items/0/requestId").asText()).isEqualTo(expectedOrder.get(2));
     var actual = new HashSet<String>();
     first.path("items").forEach(n -> actual.add(n.path("requestId").asText()));
     second.path("items").forEach(n -> actual.add(n.path("requestId").asText()));
@@ -748,6 +762,146 @@ class ChangeRequestIntegrationTests {
             get(base() + "/change-requests").with(authentication(login(owner))).param("size", "51"))
         .andExpect(status().isBadRequest());
     assertThat(first.at("/items/0/counts/pending").asInt()).isEqualTo(1);
+  }
+
+  @ParameterizedTest
+  @ValueSource(ints = {1, 50})
+  void listReadsOnlySummaryColumnsWithConstantQueryCount(int size) throws Exception {
+    for (int i = 0; i < 50; i++) {
+      var input = batch();
+      input
+          .withArray("entries")
+          .addObject()
+          .put("sourceType", "DIRECT_INPUT")
+          .put("action", "CREATE_ITEM")
+          .set("values", createValues("QUESTION", "합성 질문 " + i));
+      postData(member, "/change-requests", input, 201);
+    }
+    clearInvocations(jdbc);
+
+    var result = requestQueries.list(member, space, null, null, size);
+
+    assertThat(result.path("items").size()).isEqualTo(size);
+    var statements = listQueryStatements();
+    // Current membership, request headers and all page entry summaries.
+    assertThat(statements).hasSize(3);
+    assertThat(String.join("\n", statements))
+        .doesNotContain(
+            "requested_values",
+            "applied_values",
+            "care_document_available(",
+            "JOIN content_document",
+            "change_request_decision_batch");
+  }
+
+  @Test
+  void listPreservesMixedEntrySummariesAndCountsAfterSourceErasure() throws Exception {
+    var proposals =
+        ids(
+            propose(
+                List.of(
+                    new Spec("CREATE", "SCHEDULE", null, Map.of("title", "대기"), List.of()),
+                    new Spec("CREATE", "SCHEDULE", null, Map.of("title", "승인"), List.of()),
+                    new Spec("CREATE", "SCHEDULE", null, Map.of("title", "거절"), List.of()),
+                    new Spec("CREATE", "SCHEDULE", null, Map.of("title", "취소"), List.of()))));
+    var erasedSource =
+        propose(List.of(new Spec("CREATE", "SCHEDULE", null, Map.of("title", "삭제 원본"), List.of())));
+    var input = batch();
+    for (UUID proposal : proposals)
+      input
+          .withArray("entries")
+          .add(memberEntry(member, proposal, null, createValues("SCHEDULE", "목록에 노출하지 않을 요청 본문")));
+    input
+        .withArray("entries")
+        .add(
+            memberEntry(
+                member, ids(erasedSource).getFirst(), null, createValues("SCHEDULE", "삭제할 요청 본문")));
+    input
+        .withArray("entries")
+        .addObject()
+        .put("sourceType", "DIRECT_INPUT")
+        .put("action", "CREATE_ITEM")
+        .set("values", createValues("QUESTION", "직접 입력 질문"));
+    var submitted = postData(member, "/change-requests", input, 201);
+    UUID request = uuid(submitted, "requestId");
+    postData(owner, "/request-applications", approval(request, 1, null), 200);
+    var decline = batch();
+    decline.withArray("entries").add(decisionEntry(detail(owner, request).at("/entries/2")));
+    postData(owner, "/request-declines", decline, 200);
+    postData(
+        member,
+        "/change-requests/" + request + "/cancellations",
+        cancellation(detail(member, request).at("/entries/3")),
+        200);
+    erase(erasedSource);
+
+    var expectedEntries = mapper.createArrayNode();
+    var statuses = List.of("PENDING", "APPLIED", "DECLINED", "CANCELED", "INVALIDATED", "PENDING");
+    for (int i = 0; i < statuses.size(); i++)
+      expectedEntries
+          .addObject()
+          .put("sourceType", i == 5 ? "DIRECT_INPUT" : "AI_PROPOSAL")
+          .put("requestEntryId", submitted.at("/entries/" + i + "/requestEntryId").asText())
+          .put("action", "CREATE_ITEM")
+          .putNull("targetItemId")
+          .put("status", statuses.get(i))
+          .put("invalidReason", i == 4 ? "PROPOSAL_INVALIDATED" : null);
+    for (String status : Set.of("PENDING", "APPLIED", "DECLINED", "CANCELED", "INVALIDATED")) {
+      var result = getData(member, "/change-requests?status=" + status);
+      assertThat(result.path("items").size()).isEqualTo(1);
+      var row = result.at("/items/0");
+      assertThat(row.path("requestId").asText()).isEqualTo(request.toString());
+      assertThat(row.path("submittedAt")).isEqualTo(submitted.path("submittedAt"));
+      assertThat(row.path("submittedBy"))
+          .isEqualTo(
+              mapper.readTree(
+                  """
+          {"membershipId":"%s","displayName":"합성 가족","withdrawn":false}
+          """
+                      .formatted(memberMembership)));
+      assertThat(row.path("counts"))
+          .isEqualTo(
+              mapper.readTree(
+                  """
+          {"pending":2,"applied":1,"declined":1,"canceled":1,"invalidated":1}
+          """));
+      assertThat(row.path("entries")).isEqualTo(expectedEntries);
+      assertThat(result.path("hasNext").asBoolean()).isFalse();
+      assertThat(result.path("nextCursor").isNull()).isTrue();
+    }
+  }
+
+  @Test
+  void emptyListsSkipEntryQueriesAndStillEnforceCurrentMembership() throws Exception {
+    clearInvocations(jdbc);
+    var result = requestQueries.list(member, space, null, null, 50);
+    assertThat(result)
+        .isEqualTo(
+            mapper.readTree(
+                """
+        {"hasNext":false,"nextCursor":null,"items":[]}
+        """));
+    assertThat(listQueryStatements()).hasSize(2);
+    UUID outsider = user();
+    mvc.perform(get(base() + "/change-requests").with(authentication(login(outsider))))
+        .andExpect(status().isForbidden())
+        .andExpect(jsonPath("$.code").value("FORBIDDEN"));
+    UUID otherSpace =
+        spaces.create(member, new CreateCareSpaceRequest("다른 합성 공간", UUID.randomUUID())).spaceId();
+    assertThat(requestQueries.list(member, otherSpace, null, null, 50).path("items").isEmpty())
+        .isTrue();
+  }
+
+  private List<String> listQueryStatements() {
+    return mockingDetails(jdbc).getInvocations().stream()
+        .filter(
+            i ->
+                i.getMethod().getName().equals("query")
+                    && i.getRawArguments().length == 3
+                    && i.getRawArguments()[0] instanceof String
+                    && i.getRawArguments()[1] instanceof RowMapper<?>)
+        .map(i -> (String) i.getRawArguments()[0])
+        .toList();
   }
 
   @ParameterizedTest
