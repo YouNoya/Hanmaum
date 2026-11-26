@@ -13,6 +13,12 @@ import com.hanmaum.backend.analysis.dto.RetryAnalysisRequest;
 import com.hanmaum.backend.analysis.entity.AnalysisStatus;
 import com.hanmaum.backend.analysis.repository.AnalysisRepository;
 import com.hanmaum.backend.analysis.service.*;
+import com.hanmaum.backend.careitem.dto.CreateCareItemRequest;
+import com.hanmaum.backend.careitem.dto.ScheduleFields;
+import com.hanmaum.backend.careitem.service.CareItemCreationService;
+import com.hanmaum.backend.careitem.service.CareItemQueryService;
+import com.hanmaum.backend.careitem.service.DirectCareItemUpdateService;
+import com.hanmaum.backend.careitem.service.EditLockService;
 import com.hanmaum.backend.global.security.oauth.MemberOAuth2User;
 import com.hanmaum.backend.proposal.dto.*;
 import com.hanmaum.backend.proposal.repository.AnalysisProposalRepository;
@@ -98,6 +104,10 @@ class AnalysisV2IntegrationTests {
   @Autowired AnalysisSubmissionService submissions;
   @Autowired AnalysisExecutionService execution;
   @Autowired AnalysisProcessor processor;
+  @Autowired CareItemCreationService itemCreation;
+  @Autowired CareItemQueryService itemQueries;
+  @Autowired DirectCareItemUpdateService itemUpdates;
+  @Autowired EditLockService itemLocks;
   @Autowired ProposalQueryService queries;
   @MockitoSpyBean AnalysisProposalRepository storage;
   @MockitoSpyBean HanmaumAiV2Client client;
@@ -346,6 +356,122 @@ class AnalysisV2IntegrationTests {
                 String.class,
                 record))
         .isEqualTo(request.path("content").asText());
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"0001-01-01", "9999-12-31", "2000-02-29"})
+  void publicDateBoundariesRemainUnchangedInStoredAndCapturedValues(String date) throws Exception {
+    var scenario =
+        scenarios()
+            .filter(c -> c.path("caseId").asText().equals("C-empty"))
+            .findFirst()
+            .orElseThrow();
+    request = read(scenario.path("request").path("bodyFile").asText());
+    ((ObjectNode) request).putArray("candidates");
+    seed(scenario);
+    UUID item =
+        itemCreation
+            .create(
+                owner,
+                space,
+                new CreateCareItemRequest(
+                    "SCHEDULE",
+                    "날짜 경계값",
+                    null,
+                    new ScheduleFields(date, null, null),
+                    UUID.randomUUID()))
+            .itemId();
+    assertThat(itemQueries.detail(owner, space, item).fields().path("scheduledDate").asText())
+        .isEqualTo(date);
+    accept(scenario);
+
+    var work = execution.claim(space, run, Duration.ofMinutes(2)).orElseThrow();
+    assertThat(work.v2Request().candidates()).hasSize(1);
+    var candidate = work.v2Request().candidates().getFirst();
+    assertThat(candidate.itemId()).isEqualTo(item);
+    assertThat(candidate.currentValues())
+        .isInstanceOfSatisfying(
+            com.hanmaum.backend.ai.dto.v2.AiV2CurrentValues.Schedule.class,
+            values -> assertThat(values.scheduledDate()).isEqualTo(date));
+    assertThat(runs.find(space, record, run).orElseThrow().status())
+        .isEqualTo(AnalysisStatus.RUNNING);
+    verifyNoInteractions(client, legacy);
+  }
+
+  @Test
+  void legacyYearZeroRequiresExplicitCorrectionBeforeAnalysisCanBeRetried() throws Exception {
+    var scenario =
+        scenarios()
+            .filter(c -> c.path("caseId").asText().equals("C-empty"))
+            .findFirst()
+            .orElseThrow();
+    request = read(scenario.path("request").path("bodyFile").asText());
+    ((ObjectNode) request).putArray("candidates");
+    seed(scenario);
+    UUID item =
+        itemCreation
+            .create(
+                owner,
+                space,
+                new CreateCareItemRequest(
+                    "SCHEDULE",
+                    "기존 날짜 데이터",
+                    null,
+                    new ScheduleFields("2026-10-15", null, null),
+                    UUID.randomUUID()))
+            .itemId();
+    // Synthetic legacy data only; production writes must reject this value.
+    jdbc.update(
+        """
+        UPDATE content_document SET body=jsonb_set(body,'{fields,scheduledDate}','"0000-01-01"'::jsonb)
+        WHERE id=(SELECT current_document_id FROM care_item WHERE id=?)
+        """,
+        item);
+    String before =
+        jdbc.queryForObject(
+            "SELECT d.body::text FROM care_item i JOIN content_document d ON d.id=i.current_document_id WHERE i.id=?",
+            String.class,
+            item);
+    accept(scenario);
+
+    assertThat(execution.claim(space, run, Duration.ofMinutes(2))).isEmpty();
+    var failed = runs.find(space, record, run).orElseThrow();
+    assertThat(failed.status()).isEqualTo(AnalysisStatus.FAILED);
+    assertThat(failed.failureCode()).isEqualTo(AnalysisFailureCode.AI_INTEGRATION_ERROR);
+    assertThat(
+            jdbc.queryForObject(
+                "SELECT d.body::text FROM care_item i JOIN content_document d ON d.id=i.current_document_id WHERE i.id=?",
+                String.class,
+                item))
+        .isEqualTo(before);
+    assertThat(itemQueries.detail(owner, space, item).fields().path("scheduledDate").asText())
+        .isEqualTo("0000-01-01");
+    assertThat(count("analysis_input_item")).isZero();
+    assertThat(
+            jdbc.queryForObject("SELECT body FROM source_record WHERE id=?", String.class, record))
+        .isEqualTo(request.path("content").asText());
+    verifyNoInteractions(client, legacy);
+    var correction =
+        mapper
+            .createObjectNode()
+            .put("clientRequestId", UUID.randomUUID().toString())
+            .put("expectedItemVersion", "1")
+            .put("leaseToken", itemLocks.acquire(owner, space, item, 1).leaseToken());
+    correction.putObject("values").putObject("fields").put("scheduledDate", "2026-10-15");
+    itemUpdates.update(owner, space, item, correction, false);
+    UUID retry =
+        submissions
+            .retry(requester, space, record, new RetryAnalysisRequest(run, "1", UUID.randomUUID()))
+            .analysisId();
+    var retried = execution.claim(space, retry, Duration.ofMinutes(2)).orElseThrow();
+    assertThat(retried.v2Request().candidates()).hasSize(1);
+    assertThat(retried.v2Request().candidates().getFirst().currentValues())
+        .isInstanceOfSatisfying(
+            com.hanmaum.backend.ai.dto.v2.AiV2CurrentValues.Schedule.class,
+            values -> assertThat(values.scheduledDate()).isEqualTo("2026-10-15"));
+    assertThat(runs.find(space, record, retry).orElseThrow().status())
+        .isEqualTo(AnalysisStatus.RUNNING);
+    verifyNoInteractions(client, legacy);
   }
 
   @Test

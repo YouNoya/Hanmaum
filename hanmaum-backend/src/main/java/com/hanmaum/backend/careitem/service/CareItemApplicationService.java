@@ -348,7 +348,7 @@ public class CareItemApplicationService {
     try {
       if (Set.of("scheduledDate", "dueDate", "observedDate", "receivedDate").contains(field)) {
         if (!value.matches("[0-9]{4}-[0-9]{2}-[0-9]{2}")) throw new IllegalArgumentException();
-        LocalDate.parse(value);
+        if (LocalDate.parse(value).getYear() < 1) throw new IllegalArgumentException();
       } else if (field.equals("scheduledTime")) {
         if (!value.matches("[0-9]{2}:[0-9]{2}")) throw new IllegalArgumentException();
         LocalTime.parse(value);

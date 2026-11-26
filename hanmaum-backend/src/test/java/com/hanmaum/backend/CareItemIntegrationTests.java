@@ -27,6 +27,7 @@ import java.util.concurrent.*;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -181,6 +182,43 @@ class CareItemIntegrationTests {
         "{\"itemType\":\"SCHEDULE\",\"title\":\"일정\",\"status\":\"COMPLETED\",\"fields\":{}}",
         "{\"itemType\":\"SCHEDULE\",\"title\":\"\\u0000\",\"fields\":{}}",
         "{\"itemType\":\"SCHEDULE\",\"title\":\"\\ud800\",\"fields\":{}}");
+  }
+
+  @ParameterizedTest
+  @CsvSource({"SCHEDULE,scheduledDate", "TASK,dueDate"})
+  void rejectsYearZeroAtThePublicCreationBoundaryWithoutWritingAnything(String type, String field)
+      throws Exception {
+    var input =
+        mapper
+            .createObjectNode()
+            .put("itemType", type)
+            .put("title", "날짜 확인")
+            .put("clientRequestId", UUID.randomUUID().toString());
+    input.putObject("fields").put(field, "0000-01-01");
+    mvc.perform(
+            post(path())
+                .with(authentication(login(owner)))
+                .with(csrf())
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(input.toString()))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.code").value("INVALID_REQUEST"))
+        .andExpect(jsonPath("$.errors[0].field").value("body.fields." + field))
+        .andExpect(jsonPath("$.errors[0].reason").value("유효한 날짜 또는 시각을 입력해주세요."));
+    assertThat(count()).isZero();
+    assertThat(
+            jdbc.queryForObject(
+                "SELECT count(*) FROM command_receipt WHERE actor_user_id=? AND client_request_id=?",
+                Long.class,
+                owner,
+                UUID.fromString(input.path("clientRequestId").asText())))
+        .isZero();
+    assertThat(
+            jdbc.queryForObject(
+                "SELECT count(*) FROM content_document WHERE space_id=?",
+                Long.class,
+                space.spaceId()))
+        .isZero();
   }
 
   @ParameterizedTest

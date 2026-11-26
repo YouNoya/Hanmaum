@@ -764,6 +764,43 @@ class ChangeRequestIntegrationTests {
     assertThat(first.at("/items/0/counts/pending").asInt()).isEqualTo(1);
   }
 
+  @Test
+  void yearZeroInSubmissionOrOwnerOverrideCannotPartiallyPersistARequest() throws Exception {
+    var input = batch();
+    input
+        .withArray("entries")
+        .addObject()
+        .put("sourceType", "DIRECT_INPUT")
+        .put("action", "CREATE_ITEM")
+        .set("values", createValues("TASK", "정상 할 일"));
+    var schedule = createValues("SCHEDULE", "날짜 확인");
+    schedule.withObject("fields").put("scheduledDate", "0000-01-01");
+    input
+        .withArray("entries")
+        .addObject()
+        .put("sourceType", "DIRECT_INPUT")
+        .put("action", "CREATE_ITEM")
+        .set("values", schedule);
+    postError(member, "/change-requests", input, 400, "INVALID_REQUEST");
+    assertThat(count("change_request", "space_id", space)).isZero();
+    assertThat(count("content_document", "space_id", space)).isZero();
+    assertThat(count("care_item", "space_id", space)).isZero();
+
+    schedule.withObject("fields").put("scheduledDate", "2026-10-15");
+    UUID request = uuid(postData(member, "/change-requests", input, 201), "requestId");
+    var approval = approval(request, 0, null);
+    var invalidOverride = createValues("TASK", "소유자 확인");
+    invalidOverride.withObject("fields").put("dueDate", "0000-01-01");
+    ((ObjectNode) approval.at("/entries/0")).set("values", invalidOverride);
+    postError(owner, "/request-applications", approval, 400, "INVALID_REQUEST");
+    assertThat(detail(owner, request).at("/counts/pending").asInt()).isEqualTo(2);
+    assertThat(count("change_request_decision_batch", "space_id", space)).isZero();
+    assertThat(count("care_item", "space_id", space)).isZero();
+    invalidOverride.withObject("fields").put("dueDate", "2000-02-29");
+    postData(owner, "/request-applications", approval, 200);
+    assertThat(detail(owner, request).at("/counts/applied").asInt()).isEqualTo(1);
+  }
+
   @ParameterizedTest
   @ValueSource(ints = {1, 50})
   void listReadsOnlySummaryColumnsWithConstantQueryCount(int size) throws Exception {
