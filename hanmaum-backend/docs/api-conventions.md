@@ -14,6 +14,8 @@
 
 식별자는 UUID 문자열, 공개 버전은 십진 정수 문자열, 응답 시각은 UTC ISO 8601을 사용한다. 날짜만 있는 일정은 시간을 임의로 채우지 않는다.
 
+돌봄 항목의 `scheduledDate`, `dueDate`, `observedDate`, `receivedDate`는 `YYYY-MM-DD` 형식의 실제 존재하는 날짜이며, 연도는 `0001`부터 `9999`까지 허용한다. 연도 `0000`을 포함한 유효하지 않은 날짜 입력은 `400 INVALID_REQUEST`와 해당 필드 오류로 거절한다. 날짜의 `null`·생략 처리는 각 API의 기존 규칙을 따른다.
+
 ## 오류 처리
 
 - `400 INVALID_REQUEST`는 입력 오류, `401 UNAUTHENTICATED`는 인증 오류, `403 FORBIDDEN`은 권한·CSRF 오류, `404 RESOURCE_NOT_FOUND`는 유효한 대상이 없는 경우다.

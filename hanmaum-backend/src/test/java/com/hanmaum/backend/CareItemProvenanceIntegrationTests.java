@@ -34,6 +34,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.annotation.Import;
 import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.oauth2.client.authentication.OAuth2AuthenticationToken;
@@ -144,6 +145,56 @@ class CareItemProvenanceIntegrationTests {
     assertThat(data(member, item, "/history/1").path("evidenceIds"))
         .extracting(JsonNode::asText)
         .containsExactly(evidence.get(0).path("evidenceId").asText());
+  }
+
+  @Test
+  void invalidDateEditsAndReconfirmationKeepTheVersionHistoryAndLease() throws Exception {
+    UUID item = schedule("기존 일정");
+    var edit = command(owner, item, 1);
+    edit.putObject("values").putObject("fields").put("scheduledDate", "0000-01-01");
+    mvc.perform(
+            patch("/api/spaces/" + space + "/items/" + item)
+                .with(authentication(login(owner)))
+                .with(csrf())
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(edit.toString()))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.code").value("INVALID_REQUEST"))
+        .andExpect(jsonPath("$.errors[0].field").value("values.fields.scheduledDate"));
+    assertThat(data(owner, item, "/history").path("items").size()).isEqualTo(1);
+    assertThat(data(owner, item, "").path("version").asText()).isEqualTo("1");
+    assertThat(
+            db.queryForObject(
+                "SELECT count(*) FROM care_item_edit_lock WHERE item_id=?", Long.class, item))
+        .isEqualTo(1);
+    // Enter the existing reconfirmation flow using synthetic state, not source deletion.
+    db.update("DELETE FROM care_item_edit_lock WHERE item_id=?", item);
+    db.update("UPDATE care_item SET needs_reconfirmation=TRUE WHERE id=?", item);
+    var body = reconfirmationBody("1", acquireReconfirmation(item, "1"), "확인한 일정");
+    body.withObject("/values/fields").put("scheduledDate", "0000-01-01");
+    postItem(owner, item, "/reconfirmations", body)
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.code").value("INVALID_REQUEST"))
+        .andExpect(jsonPath("$.errors[0].field").value("values.fields.scheduledDate"));
+    assertThat(db.queryForObject("SELECT version FROM care_item WHERE id=?", Long.class, item))
+        .isEqualTo(1L);
+    assertThat(
+            db.queryForObject(
+                "SELECT needs_reconfirmation FROM care_item WHERE id=?", Boolean.class, item))
+        .isTrue();
+    assertThat(
+            db.queryForObject(
+                "SELECT count(*) FROM care_item_history WHERE item_id=?", Long.class, item))
+        .isEqualTo(1);
+    assertThat(
+            db.queryForObject(
+                "SELECT count(*) FROM care_item_edit_lock WHERE item_id=?", Long.class, item))
+        .isEqualTo(1);
+    body.withObject("/values/fields").put("scheduledDate", "0001-01-01");
+    postItem(owner, item, "/reconfirmations", body)
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.data.version").value("2"));
+    assertThat(data(owner, item, "").at("/fields/scheduledDate").asText()).isEqualTo("0001-01-01");
   }
 
   @Test
