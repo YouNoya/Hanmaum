@@ -200,6 +200,39 @@ public class ChangeRequestRepository {
         request);
   }
 
+  public List<EntrySummary> entrySummaries(UUID space, List<UUID> requestIds) {
+    if (requestIds.isEmpty()) return List.of();
+    String placeholders = String.join(",", Collections.nCopies(requestIds.size(), "?"));
+    var params = new ArrayList<Object>();
+    params.add(space);
+    params.addAll(requestIds);
+    return jdbc.query(
+        """
+        SELECT e.id,e.request_id,e.proposal_id,e.action,e.target_item_id,e.status,
+          change_request_entry_invalid_reason(e.id) invalid_reason
+        FROM change_request_entry e
+        WHERE e.space_id=? AND e.request_id IN (%s)
+        ORDER BY e.request_id,e.ordinal_no
+        """
+            .formatted(placeholders),
+        (rs, n) -> {
+          String reason = rs.getString("invalid_reason");
+          return new EntrySummary(
+              rs.getObject("id", UUID.class),
+              rs.getObject("request_id", UUID.class),
+              rs.getObject("proposal_id", UUID.class),
+              rs.getString("action"),
+              rs.getObject("target_item_id", UUID.class),
+              effectiveStatus(rs.getString("status"), reason),
+              reason);
+        },
+        params.toArray());
+  }
+
+  private static String effectiveStatus(String stored, String reason) {
+    return stored.equals("PENDING") && reason != null ? "INVALIDATED" : stored;
+  }
+
   private Entry entry(ResultSet rs, int row) throws SQLException {
     String reason = rs.getString("invalid_reason");
     String stored = rs.getString("status");
@@ -212,7 +245,7 @@ public class ChangeRequestRepository {
         rs.getObject("expected_item_version", Long.class),
         rs.getObject("request_document_id", UUID.class),
         rs.getString("requested_values"),
-        stored.equals("PENDING") && reason != null ? "INVALIDATED" : stored,
+        effectiveStatus(stored, reason),
         reason,
         rs.getObject("submitted_by_membership_id", UUID.class),
         rs.getBoolean("is_active"),
@@ -497,11 +530,25 @@ public class ChangeRequestRepository {
       String appliedValues,
       Long expectedSpaceVersion,
       String resultSpaceVersion) {
+    public EntrySummary summary() {
+      return new EntrySummary(
+          id, requestId, proposalId, action, targetItemId, status, invalidReason);
+    }
+
     @Override
     public String toString() {
       return "ChangeRequestEntry[id=" + id + "]";
     }
   }
+
+  public record EntrySummary(
+      UUID id,
+      UUID requestId,
+      UUID proposalId,
+      String action,
+      UUID targetItemId,
+      String status,
+      String invalidReason) {}
 
   public record Header(
       UUID id,

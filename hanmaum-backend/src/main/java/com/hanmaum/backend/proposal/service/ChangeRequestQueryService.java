@@ -8,8 +8,10 @@ import com.hanmaum.backend.global.code.CommonErrorCode;
 import com.hanmaum.backend.global.exception.ApiException;
 import com.hanmaum.backend.proposal.repository.ChangeRequestRepository;
 import com.hanmaum.backend.proposal.repository.ChangeRequestRepository.Entry;
+import com.hanmaum.backend.proposal.repository.ChangeRequestRepository.EntrySummary;
 import com.hanmaum.backend.proposal.repository.ChangeRequestRepository.Header;
 import java.util.*;
+import java.util.stream.Collectors;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
@@ -66,8 +68,11 @@ public class ChangeRequestQueryService {
             ? cursors.encode(space, filter, page.getLast().submittedAt(), page.getLast().id())
             : null);
     var rows = out.putArray("items");
+    var summaries =
+        requests.entrySummaries(space, page.stream().map(Header::id).toList()).stream()
+            .collect(Collectors.groupingBy(EntrySummary::requestId));
     for (var h : page) {
-      var entries = requests.entries(space, h.id());
+      var entries = summaries.getOrDefault(h.id(), List.of());
       var row = header(h, entries);
       var array = row.putArray("entries");
       for (var entry : entries) array.add(summary(entry));
@@ -83,10 +88,10 @@ public class ChangeRequestQueryService {
             .header(space, request)
             .orElseThrow(() -> new ApiException(CommonErrorCode.RESOURCE_NOT_FOUND));
     var entries = requests.entries(space, request);
-    var out = header(h, entries);
+    var out = header(h, entries.stream().map(Entry::summary).toList());
     var rows = out.putArray("entries");
     for (var e : entries) {
-      var row = summary(e);
+      var row = summary(e.summary());
       row.put("proposalId", e.proposalId() == null ? null : e.proposalId().toString());
       row.put(
           "expectedItemVersion",
@@ -156,7 +161,7 @@ public class ChangeRequestQueryService {
     return out;
   }
 
-  private ObjectNode header(Header h, List<Entry> entries) {
+  private ObjectNode header(Header h, List<EntrySummary> entries) {
     var row =
         mapper
             .createObjectNode()
@@ -177,7 +182,7 @@ public class ChangeRequestQueryService {
     return row;
   }
 
-  private ObjectNode summary(Entry e) {
+  private ObjectNode summary(EntrySummary e) {
     return mapper
         .createObjectNode()
         .put("sourceType", e.proposalId() == null ? "DIRECT_INPUT" : "AI_PROPOSAL")
